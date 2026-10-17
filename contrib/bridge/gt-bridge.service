@@ -1,0 +1,31 @@
+[Unit]
+Description=gt-bridge (Gas Town <-> externe Bots Bruecke)
+Documentation=file:/home/gastown/gastown/contrib/bridge/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gastown
+Group=gastown
+Slice=gastown.slice
+
+# Tokens/Secrets fuer die Bridge. Enthaelt BRIDGE_TOKEN_*, BRIDGE_SCOPE_*,
+# optional SLACK_WEBHOOK_URL / SLACK_BOT_TOKEN.
+EnvironmentFile=/home/gastown/.config/gt-bridge/bridge.env
+
+# Pfad zu dieser Datei / diesem Skript anpassen, falls anders installiert.
+WorkingDirectory=/home/gastown/gt
+ExecStart=/usr/bin/python3 /home/gastown/gastown/contrib/bridge/gt_bridge.py
+
+Restart=on-failure
+RestartSec=5
+
+# Der Prozess bindet nur 127.0.0.1:3100 (siehe Default). Caddy proxyt davor.
+# Haertung bewusst minimal, damit subprocess (gt/bd) und der tmux-Socket unter
+# /tmp/tmux-<uid>/ weiter erreichbar sind. Nach dem ersten Testlauf koennen
+# weitere Optionen (PrivateTmp, ProtectHome, ...) ergaenzt werden.
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

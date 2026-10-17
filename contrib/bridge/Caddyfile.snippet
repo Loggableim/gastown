@@ -1,0 +1,24 @@
+# gt-bridge Caddyfile-Snippet
+#
+# WICHTIG: Dieser Block MUSS VOR der Basic-Auth des Dashboards stehen, weil
+# die Bridge eigene Bearer-Auth macht. Caddy wertet `handle`-Bloecke in
+# Reihenfolge der ersten Uebereinstimmung aus.
+#
+# Bewusst OHNE handle_path: das Praefix /api/bridge soll NICHT entfernt
+# werden, da die Bridge-Pfade mit /api/bridge/ beginnen.
+
+# --- gt-bridge (Bearer-Auth, oeffentlich erreichbar) --------------------
+handle /api/bridge/* {
+    reverse_proxy 127.0.0.1:3100
+}
+
+# --- Dashboard (Basic-Auth) ---------------------------------------------
+# Beispiel fuer den bestehenden Dashboard-Block. So anpassen, dass er NACH
+# dem bridge-Block steht.
+#
+# handle {
+#     basicauth {
+#         admin $2a$14$...   # caddy hash-password
+#     }
+#     reverse_proxy 127.0.0.1:8080
+# }
