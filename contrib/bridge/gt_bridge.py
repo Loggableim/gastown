@@ -49,6 +49,8 @@ ID_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
 MAX_ID_LEN = 512
 MAX_TEXT_LEN = 20000
 MAX_BODY_BYTES = 1000000
+# Outbox-Rotation: ab 5 MB wird die Datei nach <name>.1 rotiert.
+OUTBOX_MAX_BYTES = 5 * 1024 * 1024
 
 # ---------------------------------------------------------------------------
 # Zentrale Befehlstabelle -- HIER an die echte CLI anpassen.
@@ -584,26 +586,32 @@ class Outbox:
     Datei als auch ueber den HTTP-Endpunkt von Bots lesbar.
     """
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, max_bytes: Optional[int] = None):
         self.path = path
+        self.max_bytes = max_bytes or OUTBOX_MAX_BYTES
         self._lock = threading.Lock()
         self._seq: Optional[int] = None
 
     def _last_seq(self) -> int:
         last = 0
-        try:
-            with open(self.path, "r", encoding="utf-8") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    obj = _maybe_json(line)
-                    if isinstance(obj, dict):
-                        seq = obj.get("seq")
-                        if isinstance(seq, int) and not isinstance(seq, bool) and seq > last:
-                            last = seq
-        except OSError:
-            pass
+        # Auch die rotierte Datei lesen, damit die seq nach Rotation und
+        # Neustart monoton bleibt.
+        for candidate in (self.path + ".1", self.path):
+            try:
+                with open(candidate, "r", encoding="utf-8") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        obj = _maybe_json(line)
+                        if isinstance(obj, dict):
+                            seq = obj.get("seq")
+                            if (isinstance(seq, int)
+                                    and not isinstance(seq, bool)
+                                    and seq > last):
+                                last = seq
+            except OSError:
+                continue
         return last
 
     def write(self, entry: Dict[str, Any]) -> Dict[str, Any]:
@@ -615,12 +623,30 @@ class Outbox:
             record["seq"] = self._seq
             record.setdefault("ts", utc_now())
             line = json.dumps(record, ensure_ascii=False, sort_keys=True)
+            data = (line + "\n").encode("utf-8")
             try:
                 directory = os.path.dirname(self.path)
                 if directory:
                     os.makedirs(directory, exist_ok=True)
-                with open(self.path, "a", encoding="utf-8") as fh:
-                    fh.write(line + "\n")
+                try:
+                    size = os.path.getsize(self.path)
+                except OSError:
+                    size = 0
+                if size > 0 and size + len(data) > self.max_bytes:
+                    # Rotation nach Groesse: aktuelle Datei -> <name>.1.
+                    os.replace(self.path, self.path + ".1")
+                # Modus 0600 per os.open anlegen; fchmod erzwingt den Modus
+                # unabhaengig von einer evtl. weiten umask.
+                fd = os.open(
+                    self.path,
+                    os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+                    0o600,
+                )
+                try:
+                    os.fchmod(fd, 0o600)
+                    os.write(fd, data)
+                finally:
+                    os.close(fd)
             except OSError:
                 self._seq -= 1
                 raise
@@ -1473,19 +1499,32 @@ class OutboundPoller(threading.Thread):
         return None
 
     @staticmethod
+    def _content_digest(etype: str, event: Dict[str, Any],
+                        payload: Dict[str, Any]) -> str:
+        """sha256 ueber kind+actor+subject+body/payload (ohne Zeitstempel)."""
+        subject = (payload.get("subject") or payload.get("title")
+                   or event.get("subject") or "")
+        body = payload.get("body") or payload.get("message") or ""
+        canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                               default=str)
+        raw = "\n".join([
+            str(etype),
+            str(event.get("actor") or ""),
+            str(subject),
+            str(body),
+            canonical,
+        ])
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    @staticmethod
     def _event_id(event: Dict[str, Any], etype: str,
                   payload: Dict[str, Any]) -> str:
         for key in ("id", "mr", "bead", "escalation", "session_id", "session"):
             value = payload.get(key)
             if value:
                 return f"{etype}:{key}:{value}"
-        raw = json.dumps(
-            {"type": event.get("type"), "ts": event.get("ts"),
-             "actor": event.get("actor"), "payload": payload},
-            sort_keys=True,
-        )
-        digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
-        return f"{etype}:{digest}"
+        digest = OutboundPoller._content_digest(etype, event, payload)
+        return f"{etype}:sha256:{digest}"
 
     @staticmethod
     def _format_message(etype: str, event: Dict[str, Any],

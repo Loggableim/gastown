@@ -917,6 +917,77 @@ class OverseerMailTests(BridgeTestCase):
         self.assertFalse(payload["ok"])
 
 
+
+class OutboxHardeningTests(BridgeTestCase):
+    def _path(self):
+        return os.path.join(self.root, "outbox-hardening.jsonl")
+
+    def test_outbox_file_mode_0600(self):
+        path = self._path()
+        outbox = gb.Outbox(path)
+        outbox.write({"kind": "escalation"})
+        self.assertEqual(oct(os.stat(path).st_mode & 0o777), "0o600")
+
+    def test_outbox_rotation_creates_dot_one(self):
+        path = self._path()
+        outbox = gb.Outbox(path, max_bytes=200)
+        for i in range(20):
+            outbox.write({"kind": "pr_merged", "payload": {"mr": i},
+                          "pad": "x" * 60})
+        self.assertTrue(os.path.exists(path + ".1"))
+
+    def test_outbox_seq_monotonic_after_rotation_and_restart(self):
+        path = self._path()
+        outbox = gb.Outbox(path, max_bytes=200)
+        seqs = [outbox.write({"kind": "x", "pad": "y" * 60})["seq"]
+                for _ in range(20)]
+        self.assertEqual(seqs, list(range(1, 21)))
+        self.assertTrue(os.path.exists(path + ".1"))
+        # Neustart: neue Instanz liest die letzte seq auch aus .1.
+        restarted = gb.Outbox(path, max_bytes=200)
+        self.assertEqual(restarted.write({"kind": "x"})["seq"], 21)
+
+    def test_outbox_rotated_file_keeps_mode_0600(self):
+        path = self._path()
+        outbox = gb.Outbox(path, max_bytes=200)
+        for i in range(20):
+            outbox.write({"kind": "x", "pad": "y" * 60})
+        self.assertEqual(oct(os.stat(path).st_mode & 0o777), "0o600")
+        self.assertEqual(oct(os.stat(path + ".1").st_mode & 0o777), "0o600")
+
+    def test_event_id_content_hash_ignores_timestamp(self):
+        payload = {"rig": "tiroltourismus", "subject": "s", "body": "b"}
+        e1 = {"type": "mail", "ts": "2026-01-01T00:00:00Z",
+              "actor": "mayor", "payload": payload}
+        e2 = {"type": "mail", "ts": "2026-01-01T00:00:05Z",
+              "actor": "mayor", "payload": dict(payload)}
+        id1 = gb.OutboundPoller._event_id(e1, "overseer_mail", payload)
+        id2 = gb.OutboundPoller._event_id(e2, "overseer_mail", e2["payload"])
+        self.assertTrue(id1.startswith("overseer_mail:sha256:"))
+        self.assertEqual(id1, id2)
+
+    def test_event_id_content_hash_distinguishes_body(self):
+        ev = {"type": "mail", "ts": "t", "actor": "mayor"}
+        id1 = gb.OutboundPoller._event_id(
+            ev, "overseer_mail",
+            {"rig": "tiroltourismus", "subject": "s", "body": "b1"})
+        id2 = gb.OutboundPoller._event_id(
+            ev, "overseer_mail",
+            {"rig": "tiroltourismus", "subject": "s", "body": "b2"})
+        self.assertNotEqual(id1, id2)
+
+    def test_dedupe_by_content_not_timestamp(self):
+        payload = {"rig": "tiroltourismus", "subject": "s", "body": "b"}
+        first = gb.OutboundPoller._event_id(
+            {"type": "mail", "ts": "2026-01-01T00:00:00Z", "actor": "mayor"},
+            "overseer_mail", payload)
+        second = gb.OutboundPoller._event_id(
+            {"type": "mail", "ts": "2026-01-01T00:00:09Z", "actor": "mayor"},
+            "overseer_mail", payload)
+        self.assertTrue(self.bridge.dedupe.first_seen(first))
+        self.assertFalse(self.bridge.dedupe.first_seen(second))
+
+
 class TokenStoreTests(unittest.TestCase):
     def test_admin_and_scopes(self):
         store = gb.TokenStore.from_mapping({
