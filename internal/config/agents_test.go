@@ -1821,6 +1821,52 @@ func TestKiloAgentPreset(t *testing.T) {
 	if info.AutoSubmitDelayMs <= 0 {
 		t.Errorf("AutoSubmitDelayMs = %d, want > 0", info.AutoSubmitDelayMs)
 	}
+	if info.ReadyPromptPrefix != "" {
+		t.Errorf("ReadyPromptPrefix = %q, want empty (Kilo TUI has no stable prompt)", info.ReadyPromptPrefix)
+	}
+	if !info.BusyIndicatorIdle {
+		t.Error("BusyIndicatorIdle = false, want true (Kilo idle is detected via absence of the busy hint)")
+	}
+	if !info.HasIdleDetection() {
+		t.Error("HasIdleDetection() = false, want true for Kilo")
+	}
+}
+
+// TestHasIdleDetection pins which presets support steady-state idle detection,
+// because nudge wait-idle and the background queue drain rely on it: presets
+// without any detection must fall back to queue delivery rather than poll for a
+// prompt that never appears.
+func TestHasIdleDetection(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		preset AgentPreset
+		want   bool
+	}{
+		{"claude has prompt prefix", AgentClaude, true},
+		{"codex has prompt prefix", AgentCodex, true},
+		{"kilo uses busy indicator", AgentKilo, true},
+		{"opencode has neither", AgentOpenCode, false},
+		{"copilot has neither", AgentCopilot, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			info := GetAgentPreset(tt.preset)
+			if info == nil {
+				t.Fatalf("GetAgentPreset(%s) returned nil", tt.preset)
+			}
+			if got := info.HasIdleDetection(); got != tt.want {
+				t.Errorf("HasIdleDetection() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+
+	var nilPreset *AgentPresetInfo
+	if nilPreset.HasIdleDetection() {
+		t.Error("nil preset HasIdleDetection() = true, want false")
+	}
 }
 
 func TestKiloPresetBuildCommandWithPrompt(t *testing.T) {

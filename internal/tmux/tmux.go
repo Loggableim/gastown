@@ -2869,12 +2869,55 @@ func matchesPromptPrefix(line, readyPromptPrefix string) bool {
 	return strings.HasPrefix(trimmed, normalizedPrefix) || (prefix != "" && trimmed == prefix)
 }
 
+// busyIndicators is the single source of truth for the substrings an agent TUI
+// renders in its status bar while actively generating. Detection of "is the
+// agent working?" scrapes the pane for any of these (see hasBusyIndicator), and
+// that signal underpins IsIdle, WaitForIdle, and the nudge Escape-suppression in
+// shouldSendEscape. Claude Code, Codex, and Gemini surface "esc to interrupt";
+// Kilo Code and its OpenCode fork render the shorter "esc interrupt". If an
+// agent uses different wording, add it here — that is the only place that needs
+// to change.
+var busyIndicators = []string{"esc to interrupt", "esc interrupt"}
+
 func hasBusyIndicator(line string) bool {
 	trimmed := strings.TrimSpace(line)
 	if trimmed == "" {
 		return false
 	}
-	return strings.Contains(trimmed, "esc to interrupt")
+	for _, marker := range busyIndicators {
+		if marker == "" {
+			continue
+		}
+		if strings.Contains(trimmed, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// idleDetectionForSession resolves how to detect the session's idle state.
+// It returns the ready-prompt prefix to match and whether idle detection should
+// instead rely only on the absence of a busy indicator (for agents like Kilo
+// Code whose TUI has no stable prompt prefix). When neither is available the
+// returned prefix falls back to DefaultReadyPromptPrefix, preserving the legacy
+// behavior for agents without any idle detection configured.
+func idleDetectionForSession(t *Tmux, session string) (promptPrefix string, busyIndicatorIdle bool) {
+	promptPrefix = DefaultReadyPromptPrefix
+	agentName, err := t.GetEnvironment(session, "GT_AGENT")
+	if err != nil || agentName == "" {
+		return promptPrefix, false
+	}
+	preset := config.GetAgentPresetByName(agentName)
+	if preset == nil {
+		return promptPrefix, false
+	}
+	if preset.ReadyPromptPrefix != "" {
+		return preset.ReadyPromptPrefix, false
+	}
+	if preset.BusyIndicatorIdle {
+		return "", true
+	}
+	return promptPrefix, false
 }
 
 func readyPromptPrefixForSession(t *Tmux, session string) string {
@@ -2938,7 +2981,7 @@ const DefaultReadyPromptPrefix = "❯ "
 // Returns nil if the agent becomes idle within the timeout.
 // Returns an error if the timeout expires while the agent is still busy.
 func (t *Tmux) WaitForIdle(session string, timeout time.Duration) error {
-	promptPrefix := readyPromptPrefixForSession(t, session)
+	promptPrefix, busyIndicatorIdle := idleDetectionForSession(t, session)
 	prefix := strings.TrimSpace(promptPrefix)
 
 	// Require 2 consecutive idle polls to filter out transient states.
@@ -2982,15 +3025,21 @@ func (t *Tmux) WaitForIdle(session string, timeout time.Duration) error {
 		// Scan all captured lines for the prompt prefix.
 		// Claude Code renders a status bar below the prompt line,
 		// so the prompt may not be the last non-empty line.
-		promptFound := false
-		for _, line := range lines {
-			trimmed := strings.TrimSpace(line)
-			if trimmed == "" {
-				continue
-			}
-			if matchesPromptPrefix(trimmed, promptPrefix) || (prefix != "" && trimmed == prefix) {
-				promptFound = true
-				break
+		//
+		// Agents with BusyIndicatorIdle (Kilo Code) have no stable prompt
+		// prefix: reaching this point means no busy indicator was seen, which
+		// is their idle signal.
+		promptFound := busyIndicatorIdle
+		if !busyIndicatorIdle {
+			for _, line := range lines {
+				trimmed := strings.TrimSpace(line)
+				if trimmed == "" {
+					continue
+				}
+				if matchesPromptPrefix(trimmed, promptPrefix) || (prefix != "" && trimmed == prefix) {
+					promptFound = true
+					break
+				}
 			}
 		}
 
@@ -3037,7 +3086,9 @@ func (t *Tmux) IsAtPrompt(session string, rc *config.RuntimeConfig) bool {
 //
 // Detection strategy: check the Claude Code status bar (bottom line of the
 // pane starting with ⏵⏵). When the agent is actively working, the status
-// bar contains "esc to interrupt". When idle, it does not.
+// bar contains "esc to interrupt". When idle, it does not. Agents with
+// BusyIndicatorIdle (Kilo Code) have no prompt prefix, so the absence of the
+// busy indicator alone means idle.
 func (t *Tmux) IsIdle(session string) bool {
 	lines, err := t.CapturePaneLines(session, 5)
 	if err != nil {
@@ -3050,7 +3101,11 @@ func (t *Tmux) IsIdle(session string) bool {
 		}
 	}
 
-	promptPrefix := readyPromptPrefixForSession(t, session)
+	promptPrefix, busyIndicatorIdle := idleDetectionForSession(t, session)
+	if busyIndicatorIdle {
+		// No busy indicator found above → idle.
+		return true
+	}
 	for _, line := range lines {
 		if matchesPromptPrefix(line, promptPrefix) {
 			return true

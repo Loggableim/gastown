@@ -165,6 +165,14 @@ type AgentPresetInfo struct {
 	// the initial prompt via --prompt but leave it unsubmitted until Enter.
 	AutoSubmitDelayMs int `json:"auto_submit_delay_ms,omitempty"`
 
+	// BusyIndicatorIdle indicates the agent has no stable ready-prompt prefix
+	// (ReadyPromptPrefix is empty) but its TUI reliably renders a busy
+	// indicator (see busyIndicators in internal/tmux) while generating. Idle is
+	// then detected by the absence of that indicator across consecutive polls
+	// instead of a prompt match. Used by Kilo Code, whose TUI footer shows
+	// "esc interrupt" while working and drops it when idle.
+	BusyIndicatorIdle bool `json:"busy_indicator_idle,omitempty"`
+
 	// EscapeCancelsRequest indicates that sending an Escape keystroke to this
 	// agent cancels its in-flight generation. NudgeSession normally sends
 	// Escape (step 5) to exit vim INSERT mode — harmless for bash/Claude Code,
@@ -176,6 +184,18 @@ type AgentPresetInfo struct {
 	// ACP is the configuration for ACP (Agent Communication Protocol) support.
 	// nil means the agent does not support ACP.
 	ACP *ACPConfig `json:"acp,omitempty"`
+}
+
+// HasIdleDetection reports whether the preset supports steady-state idle
+// detection used by nudge wait-idle delivery and background queue drains.
+// Either a ready-prompt prefix (prompt match) or the busy-indicator-only mode
+// (BusyIndicatorIdle) is sufficient. When both are absent, callers must fall
+// back to queue delivery instead of polling for a prompt that never appears.
+func (p *AgentPresetInfo) HasIdleDetection() bool {
+	if p == nil {
+		return false
+	}
+	return p.ReadyPromptPrefix != "" || p.BusyIndicatorIdle
 }
 
 // ACPConfig contains configuration for ACP (Agent Communication Protocol) support.
@@ -419,6 +439,10 @@ var builtinPresets = map[AgentPreset]*AgentPresetInfo{
 		HooksDir:          ".kilo/plugins",
 		HooksSettingsFile: "gastown.js",
 		ReadyDelayMs:      8000,
+		// Kilo's TUI has no stable ready-prompt prefix, but its footer shows
+		// "esc interrupt" while generating and removes it when idle, so idle
+		// detection uses the absence of the busy indicator.
+		BusyIndicatorIdle: true,
 		// Kilo's TUI does not submit the initial --prompt automatically.
 		AutoSubmitDelayMs: 12000,
 		InstructionsFile:  "AGENTS.md",

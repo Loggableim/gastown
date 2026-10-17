@@ -205,10 +205,12 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 		// Non-Claude agents (Gemini, Codex, etc.) have no ReadyPromptPrefix,
 		// so WaitForIdle produces false positives — it sees no busy indicator
 		// and matches stale prompt characters in the pane buffer. (GH#gt-5ey3)
-		// Degrade to queue mode for agents without prompt-based detection.
+		// Agents that opt into busy-indicator idle detection (Kilo Code) can
+		// still use wait-idle even without a prompt prefix.
+		// Degrade to queue mode only for agents with no idle detection at all.
 		if agentName, err := t.GetEnvironment(sessionName, "GT_AGENT"); err == nil && agentName != "" {
 			preset := config.GetAgentPresetByName(agentName)
-			if preset != nil && preset.ReadyPromptPrefix == "" {
+			if preset != nil && !preset.HasIdleDetection() {
 				fmt.Fprintf(os.Stderr, "wait-idle: %s agent %q has no prompt detection, using queue mode\n", sessionName, agentName)
 				if qErr := nudge.Enqueue(townRoot, sessionName, nudge.QueuedNudge{
 					Sender:   sender,
