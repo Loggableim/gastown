@@ -1,6 +1,8 @@
 package cmd
 
 import (
+	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -224,5 +226,112 @@ func TestFilterReadyIssuesByRoute(t *testing.T) {
 	filtered = filterReadyIssuesByRoute(townRoot, "bd_symphony", issues)
 	if got, want := issueIDs(filtered), []string{"bds-123"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("rig filtered IDs = %v, want %v", got, want)
+	}
+}
+
+// TestRunReadyIncludesRigRootBeadsWithMetadataDatabase is a regression test for
+// gt ready showing a rig-root .beads database as empty. bd was pinned to the
+// rig's BEADS_DIR but not to the database named in .beads/metadata.json, so a
+// stale/ambient BEADS_DOLT_SERVER_DATABASE (or bd's default) selected the town
+// database. The rig source then reported only hq-* beads, which
+// filterReadyIssuesByRoute drops, producing an empty-looking rig with no error.
+func TestRunReadyIncludesRigRootBeadsWithMetadataDatabase(t *testing.T) {
+	townRoot := t.TempDir()
+	writeFile := func(path, content string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	writeFile(filepath.Join(townRoot, "mayor", "town.json"), "{}")
+	writeFile(filepath.Join(townRoot, ".beads", "routes.jsonl"),
+		`{"prefix":"hq-","path":"."}`+"\n"+`{"prefix":"ti-","path":"tiroltourismus"}`+"\n")
+	writeFile(filepath.Join(townRoot, "mayor", "rigs.json"),
+		`{"version":1,"rigs":{"tiroltourismus":{"git_url":"x","added_at":"2026-01-01T00:00:00Z"}}}`)
+
+	rigRoot := filepath.Join(townRoot, "tiroltourismus")
+	writeFile(filepath.Join(rigRoot, ".beads", "metadata.json"),
+		`{"backend":"dolt","dolt_database":"ti"}`)
+
+	binDir := t.TempDir()
+	bd := filepath.Join(binDir, "bd")
+	script := `#!/bin/sh
+if [ "$1" = "--allow-stale" ]; then
+  case "$*" in
+    *version*) printf 'bd 1.0.0\n'; exit 0;;
+  esac
+fi
+case "$*" in
+  *"mol wisp list"*) printf '{"wisps":[],"count":0}\n'; exit 0;;
+  *ready*)
+    if [ "${BEADS_DOLT_SERVER_DATABASE:-}" = "ti" ]; then
+      printf '[{"id":"ti-4ng","title":"Rig work","priority":2,"issue_type":"task"}]\n'
+    else
+      printf '[{"id":"hq-999","title":"Wrong database","priority":2,"issue_type":"task"}]\n'
+    fi
+    exit 0;;
+  *) printf '[]\n'; exit 0;;
+esac
+`
+	if err := os.WriteFile(bd, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	// Stale ambient selector that must not override the rig metadata database.
+	t.Setenv("BEADS_DOLT_SERVER_DATABASE", "wrong")
+	t.Setenv("GT_TOWN_ROOT", townRoot)
+	beads.ResetBdAllowStaleCacheForTest()
+
+	oldWD, _ := os.Getwd()
+	if err := os.Chdir(townRoot); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(oldWD) }()
+
+	oldStdout := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+	oldJSON, oldRig := readyJSON, readyRig
+	readyJSON, readyRig = true, ""
+	err := runReady(nil, nil)
+	_ = w.Close()
+	os.Stdout = oldStdout
+	readyJSON, readyRig = oldJSON, oldRig
+	if err != nil {
+		t.Fatalf("runReady: %v", err)
+	}
+
+	var buf strings.Builder
+	if _, err := io.Copy(&buf, r); err != nil {
+		t.Fatal(err)
+	}
+
+	var res struct {
+		Sources []struct {
+			Name   string `json:"name"`
+			Issues []struct {
+				ID string `json:"id"`
+			} `json:"issues"`
+		} `json:"sources"`
+	}
+	if err := json.Unmarshal([]byte(buf.String()), &res); err != nil {
+		t.Fatalf("unmarshal ready JSON: %v\n%s", err, buf.String())
+	}
+
+	var rigIDs []string
+	for _, src := range res.Sources {
+		if src.Name != "tiroltourismus" {
+			continue
+		}
+		for _, issue := range src.Issues {
+			rigIDs = append(rigIDs, issue.ID)
+		}
+	}
+	if len(rigIDs) != 1 || rigIDs[0] != "ti-4ng" {
+		t.Fatalf("rig ready IDs = %v, want [ti-4ng]\noutput: %s", rigIDs, buf.String())
 	}
 }

@@ -63,9 +63,11 @@ func StripBDTargetEnv(env []string) []string {
 }
 
 // BuildPinnedBDEnv returns env for a bd subprocess pinned to beadsDir. BEADS_DIR
-// is the authoritative database selector; inherited explicit database selectors
-// are stripped because bd 1.0.x can resolve a different/stale view when both are
-// present, making newly-created routed beads invisible to gt hook/sling.
+// and the metadata-backed Dolt database are the authoritative target selectors;
+// inherited selectors are stripped first because bd 1.0.x can otherwise resolve a
+// different/stale database than the selected .beads directory. That mismatch made
+// rig-root beads invisible to gt ready (the rig .beads metadata named e.g. "ti"
+// while bd defaulted to the town/hq database).
 func BuildPinnedBDEnv(base []string, beadsDir string) []string {
 	env := SuppressBDSideEffects(StripBDTargetEnv(base))
 	if beadsDir == "" {
@@ -73,6 +75,9 @@ func BuildPinnedBDEnv(base []string, beadsDir string) []string {
 	}
 	env = append(env, "BEADS_DIR="+beadsDir)
 	env = append(env, doltTargetEnvFromBeadsDir(beadsDir)...)
+	if dbEnv := DatabaseEnv(beadsDir); dbEnv != "" {
+		env = append(env, dbEnv)
+	}
 	return addGTDerivedDoltTargetEnv(env)
 }
 
