@@ -529,9 +529,13 @@ class OutboundTests(BridgeTestCase):
         ok2 = poller.handle_event({
             "type": "merged", "actor": "tiroltourismus/a",
             "payload": {"rig": "tiroltourismus", "mr": "2"}})
+        # Beide Events werden verarbeitet (in die Outbox geschrieben), aber
+        # nur eines darf das Rate-Limit passieren und nach Slack gehen.
         self.assertTrue(ok1)
-        self.assertFalse(ok2)
+        self.assertTrue(ok2)
         self.assertEqual(len(poster.calls), 1)
+        entries, _, _ = self.bridge.outbox.read()
+        self.assertEqual(len(entries), 2)
 
     def test_handle_event_unknown_type_ignored(self):
         poster = RecordingPoster()
@@ -571,6 +575,125 @@ class OutboundTests(BridgeTestCase):
         })
         self.assertTrue(handled)
         self.assertEqual(poster.calls[0]["payload"]["channel"], "#tirol-content")
+
+
+# ---------------------------------------------------------------------------
+# JSONL-Outbox
+# ---------------------------------------------------------------------------
+
+class OutboxTests(BridgeTestCase):
+    def test_write_assigns_monotonic_seq(self):
+        first = self.bridge.outbox.write({"kind": "escalation"})
+        second = self.bridge.outbox.write({"kind": "bead_done"})
+        self.assertEqual(first["seq"], 1)
+        self.assertEqual(second["seq"], 2)
+        self.assertIn("ts", first)
+
+    def test_read_since_cursor(self):
+        for i in range(3):
+            self.bridge.outbox.write({"kind": "pr_merged", "payload": {"mr": i}})
+        entries, cursor, has_more = self.bridge.outbox.read(since=0)
+        self.assertEqual([e["seq"] for e in entries], [1, 2, 3])
+        self.assertEqual(cursor, 3)
+        self.assertFalse(has_more)
+
+        entries, cursor, _ = self.bridge.outbox.read(since=2)
+        self.assertEqual([e["seq"] for e in entries], [3])
+        self.assertEqual(cursor, 3)
+
+    def test_read_limit_and_has_more(self):
+        for i in range(5):
+            self.bridge.outbox.write({"kind": "pr_merged"})
+        entries, cursor, has_more = self.bridge.outbox.read(since=0, limit=2)
+        self.assertEqual([e["seq"] for e in entries], [1, 2])
+        self.assertEqual(cursor, 2)
+        self.assertTrue(has_more)
+
+    def test_outbox_endpoint_admin(self):
+        self.bridge.outbox.write({"kind": "escalation", "rig": "tiroltourismus"})
+        status, payload = self.call("GET", "/api/bridge/outbox",
+                                    token=ADMIN_TOKEN)
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["count"], 1)
+        self.assertEqual(payload["cursor"], 1)
+        self.assertEqual(payload["entries"][0]["kind"], "escalation")
+
+    def test_outbox_endpoint_requires_auth(self):
+        status, _ = self.call("GET", "/api/bridge/outbox")
+        self.assertEqual(status, 401)
+
+    def test_outbox_endpoint_scope_filter(self):
+        self.bridge.outbox.write({"kind": "bead_done", "rig": "tiroltourismus"})
+        self.bridge.outbox.write({"kind": "bead_done", "rig": "fremdrig"})
+        self.bridge.outbox.write({"kind": "escalation", "rig": None})
+
+        status, payload = self.call("GET", "/api/bridge/outbox",
+                                    token=VALI_TOKEN)
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["count"], 1)
+        self.assertEqual(payload["entries"][0]["rig"], "tiroltourismus")
+
+    def test_outbox_endpoint_rig_out_of_scope_403(self):
+        status, _ = self.call("GET", "/api/bridge/outbox", token=VALI_TOKEN,
+                              query={"rig": "fremdrig"})
+        self.assertEqual(status, 403)
+
+    def test_outbox_endpoint_since_query(self):
+        self.bridge.outbox.write({"kind": "bead_done"})
+        self.bridge.outbox.write({"kind": "bead_done"})
+        status, payload = self.call("GET", "/api/bridge/outbox",
+                                    token=ADMIN_TOKEN, query={"since": "1"})
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["count"], 1)
+        self.assertEqual(payload["entries"][0]["seq"], 2)
+
+
+class OverseerMailTests(BridgeTestCase):
+    def _poller(self, poster=None):
+        self.bridge.notifier = gb.SlackNotifier(
+            self.config, poster=poster or RecordingPoster()
+        )
+        return gb.OutboundPoller(self.bridge, interval=1,
+                                 stop_event=__import__("threading").Event())
+
+    def test_overseer_mail_written_without_slack_route(self):
+        # Keine Slack-Routen konfiguriert -> trotzdem in der Outbox.
+        poller = self._poller()
+        handled = poller.handle_event({
+            "type": "mail",
+            "actor": "mayor",
+            "payload": {"to": "overseer", "subject": "Status"},
+        })
+        self.assertTrue(handled)
+        entries, _, _ = self.bridge.outbox.read()
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["kind"], "overseer_mail")
+        self.assertEqual(entries[0]["actor"], "mayor")
+        self.assertIn("Status", entries[0]["text"])
+
+    def test_regular_mail_not_outboxed(self):
+        poller = self._poller()
+        handled = poller.handle_event({
+            "type": "mail",
+            "actor": "mayor",
+            "payload": {"to": "tiroltourismus/witness", "subject": "x"},
+        })
+        self.assertFalse(handled)
+        entries, _, _ = self.bridge.outbox.read()
+        self.assertEqual(entries, [])
+
+    def test_event_without_route_still_outboxed(self):
+        # Erkanntes Event ohne Slack-Route landet weiterhin in der Outbox.
+        poller = self._poller()
+        handled = poller.handle_event({
+            "type": "merged", "actor": "tiroltourismus/polecat",
+            "payload": {"rig": "tiroltourismus", "mr": "mr-9"},
+        })
+        self.assertTrue(handled)
+        entries, _, _ = self.bridge.outbox.read()
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["kind"], "pr_merged")
+        self.assertEqual(entries[0]["rig"], "tiroltourismus")
 
 
 class TokenStoreTests(unittest.TestCase):

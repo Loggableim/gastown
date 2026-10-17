@@ -3,7 +3,8 @@
 Kleine Brücke zwischen **Gas Town** und externen Bots.
 
 * **Admin-API** auf `127.0.0.1:3100`, Bearer-Auth, Scope pro Rig.
-* **Outbound-Events**: Poller liest Gas-Town-Events und postet sie nach Slack.
+* **Outbound-Events**: Poller liest Gas-Town-Events und schreibt sie als JSONL
+  in die Outbox (bot-lesbar per Datei/Endpoint); optional Post nach Slack.
 
 Nur Python-Standardbibliothek, Zielversion **Python 3.10** (Ubuntu 22.04).
 Läuft als User `gastown`. Caddy routet `agents.lastbrowser.com/api/bridge/*`
@@ -67,6 +68,7 @@ SLACK_WEBHOOK_URL=https://hooks.slack.com/services/XXX/YYY/ZZZ
 # GT_BRIDGE_RATE_LIMIT=10
 # GT_BRIDGE_RATE_WINDOW=600
 # GT_BRIDGE_ROUTES=/home/gastown/.config/gt-bridge/routes.json
+# GT_BRIDGE_OUTBOX=/home/gastown/gt/logs/bridge-outbox.jsonl
 ```
 
 Die Env-Datei sollte `chmod 600` sein. **Keine echten Tokens ins Repository.**
@@ -101,6 +103,7 @@ Auth: `Authorization: Bearer <token>`. Nur `health` ist ohne Auth.
 | GET  | `/api/bridge/ready?rig=` | `gt ready --json [--rig X]` |
 | GET  | `/api/bridge/convoys` | `gt convoy list --json` |
 | GET  | `/api/bridge/escalations` | `gt escalate list --json` |
+| GET  | `/api/bridge/outbox?since=&limit=&rig=` | JSONL-Outbox lesen (Cursor) |
 | POST | `/api/bridge/mail` | `gt mail send <to> -s <subj> -m <body>` |
 | POST | `/api/bridge/nudge` | `gt nudge <target> <message> [--mode <wait-idle|queue|immediate>]` |
 | POST | `/api/bridge/sling` | `gt sling <bead> <rig>` |
@@ -142,6 +145,9 @@ curl -s -H "Authorization: Bearer $TOKEN" "$BASE/ready?rig=tiroltourismus"
 curl -s -H "Authorization: Bearer $TOKEN" $BASE/convoys
 curl -s -H "Authorization: Bearer $TOKEN" $BASE/escalations
 
+# Outbox ab Cursor 0 lesen (nur eigene Rigs beim Nicht-Admin-Token)
+curl -s -H "Authorization: Bearer $TOKEN" "$BASE/outbox?since=0&limit=100"
+
 # Mail an den Witness des eigenen Rigs
 curl -s -X POST -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
@@ -175,7 +181,7 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" \
 
 ---
 
-## 4. Outbound-Events nach Slack
+## 4. Outbound-Events: JSONL-Outbox + Slack
 
 Der Poller (Thread, Default 60 s) nutzt primär das Event-Log
 `~/gt/.events.jsonl` (Format siehe `internal/events/events.go`):
@@ -195,18 +201,42 @@ Erkannte Typen (Mapping in `EVENT_TYPE_MAP`):
 | `agent_stuck`| `agent_stuck`, state `stuck` |
 | `agent_dead` | `session_death`, `mass_death` |
 | `bead_done`  | `done` |
+| `overseer_mail` | `mail` mit `payload.to` = `overseer`/`human` |
+
+Jedes erkannte Event wird **immer** als eine Zeile JSONL an die Outbox
+angehängt (`GT_BRIDGE_OUTBOX`, Default `~/gt/logs/bridge-outbox.jsonl`).
+Zusätzlich werden Mails an den Overseer (Mayor-Meldungen) erfasst — also
+genau die Nachrichten, die früher nur im Overseer-Postfach lagen.
+
+### Outbox-Format (eine JSON-Zeile pro Eintrag)
+
+```json
+{"seq":42,"ts":"2026-10-17T18:00:00+00:00","kind":"escalation",
+ "type":"escalation_sent","actor":"tiroltourismus/witness","rig":"tiroltourismus",
+ "event_id":"escalation:escalation:hq-1","text":"FUER-VALI FUER-AMI 🚨 ...",
+ "source":"gt","payload":{"escalation":"hq-1"}}
+```
+
+`seq` ist ein monotoner Cursor. Leser merken sich die zuletzt gelesene `seq`
+und fragen mit `GET /api/bridge/outbox?since=<seq>` nur neue Einträge ab
+(Antwort: `{ok, entries, cursor, count, has_more}`). Nicht-Admin-Tokens sehen
+nur Einträge ihrer Rigs; `&rig=<rig>` filtert zusätzlich. Die Datei ist auch
+direkt per Dateisystem lesbar.
+
+**Slack-Versand (optional)**: `SLACK_WEBHOOK_URL` (pro Rig via `webhook_env`
+überschreibbar) oder `SLACK_BOT_TOKEN` + `chat.postMessage` über `urllib`.
+Es werden **keine** Slack-Credentials ins Repo committed. Fehlt beides, wird
+nur ins Log geschrieben (Dry-run, kein Fehler). Ein Rate-Limit verwirft nur den
+Slack-Post, **nicht** den Outbox-Eintrag.
+
+Der Poller (`~/.local/state/gt-bridge/state.json`) verfolgt den Lese-Offset in
+`.events.jsonl` und die bereits gesendeten `event_id` (Dedupe). Das Rate-Limit
+(`GT_BRIDGE_RATE_LIMIT`/`GT_BRIDGE_RATE_WINDOW`, Default 10/600 s) gilt pro
+Kanal.
 
 **Fallback** (wenn `.events.jsonl` fehlt): Diff-Polling von
 `gt convoy list`, `gt ready`, `gt escalate list` und `gt status` gegen den
 letzten Zustand in `state.json`.
-
-**Versand**: `SLACK_WEBHOOK_URL` (pro Rig via `webhook_env` überschreibbar)
-oder `SLACK_BOT_TOKEN` + `chat.postMessage` über `urllib`. Fehlt beides, wird
-nur ins Log geschrieben (Dry-run, kein Fehler).
-
-**Rate-Limit**: max. `GT_BRIDGE_RATE_LIMIT` (Default 10) Posts pro Kanal pro
-`GT_BRIDGE_RATE_WINDOW` (Default 600 s). Doppelte Event-IDs werden unterdrückt.
-Zustand liegt in `~/.local/state/gt-bridge/state.json`.
 
 ---
 
