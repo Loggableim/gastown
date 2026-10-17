@@ -8,8 +8,10 @@ Standardbibliothek-only, Python 3.10. Zwei Aufgaben:
     beginnen daher mit /api/bridge/.
 
 (b) Outbound-Events: Poller-Thread liest ~/gt/.events.jsonl (oder Polling-
-    Fallback) und postet erkannte Ereignisse nach Slack. Ohne konfigurierte
-    Slack-Zugangsdaten wird nur ins Log geschrieben (dry-run).
+    Fallback) und schreibt erkannte Ereignisse als JSONL in die Outbox
+    (~/gt/logs/bridge-outbox.jsonl, per GET /api/bridge/outbox lesbar). Ohne
+    konfigurierte Slack-Zugangsdaten wird nur ins Log geschrieben (dry-run).
+    Mails an den Overseer werden immer in die Outbox geschrieben.
 
 Alle gt/bd-Unterbefehle und Flags stehen zentral in COMMANDS, damit sie am
 Server an die echte CLI angepasst werden koennen.
@@ -47,6 +49,8 @@ ID_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
 MAX_ID_LEN = 512
 MAX_TEXT_LEN = 20000
 MAX_BODY_BYTES = 1000000
+# Outbox-Rotation: ab 5 MB wird die Datei nach <name>.1 rotiert.
+OUTBOX_MAX_BYTES = 5 * 1024 * 1024
 
 # ---------------------------------------------------------------------------
 # Zentrale Befehlstabelle -- HIER an die echte CLI anpassen.
@@ -116,11 +120,16 @@ EVENT_EMOJI: Dict[str, str] = {
     "agent_stuck": "\U0001F7E0",  # 🟠
     "agent_dead": "\u26AB",       # ⚫
     "bead_done": "\U0001F3C1",    # 🏁
+    "overseer_mail": "\u2709",    # ✉
 }
 
 # Eskalationen / tote Agenten werden zusaetzlich an die Town erinnert.
 TOWN_ALERT_TYPES = {"escalation", "agent_dead", "agent_stuck"}
 TOWN_ALERT_PREFIX = "FUER-AMI"
+
+# Empfaenger, die als "Overseer"/Mensch gelten: solche Mails werden immer in
+# die Outbox geschrieben, damit Bots sie lesen koennen (Cid/Ami-Anforderung).
+OVERSEER_MAIL_RECIPIENTS = {"overseer", "human"}
 
 DEFAULT_ENV_FILE = "/home/gastown/.config/gt-bridge/bridge.env"
 DEFAULT_GT_ROOT = "/home/gastown/gt"
@@ -247,6 +256,7 @@ class Config:
     routes_file: str = "~/.config/gt-bridge/routes.json"
     state_file: str = "~/.local/state/gt-bridge/state.json"
     events_file: str = ""
+    outbox_file: str = ""
     poll_interval: int = 60
     rate_limit: int = 10
     rate_window: int = 600
@@ -285,6 +295,12 @@ class Config:
             return os.path.expanduser(self.events_file)
         return os.path.join(self.gt_root, ".events.jsonl")
 
+    @property
+    def outbox_path(self) -> str:
+        if self.outbox_file:
+            return os.path.expanduser(self.outbox_file)
+        return os.path.join(self.gt_root, "logs", "bridge-outbox.jsonl")
+
     @classmethod
     def load(cls, env_file: Optional[str] = None) -> "Config":
         path = env_file or os.environ.get("GT_BRIDGE_ENV", DEFAULT_ENV_FILE)
@@ -297,6 +313,7 @@ class Config:
         cfg.routes_file = cfg.get("GT_BRIDGE_ROUTES", "~/.config/gt-bridge/routes.json")
         cfg.state_file = cfg.get("GT_BRIDGE_STATE", "~/.local/state/gt-bridge/state.json")
         cfg.events_file = cfg.get("GT_BRIDGE_EVENTS", "")
+        cfg.outbox_file = cfg.get("GT_BRIDGE_OUTBOX", "")
         cfg.poll_interval = _env_int(cfg.get("GT_BRIDGE_POLL_INTERVAL"), 60)
         cfg.rate_limit = _env_int(cfg.get("GT_BRIDGE_RATE_LIMIT"), 10)
         cfg.rate_window = _env_int(cfg.get("GT_BRIDGE_RATE_WINDOW"), 600)
@@ -557,9 +574,122 @@ class DedupeStore:
 
 
 # ---------------------------------------------------------------------------
-# Slack-Versand
+# JSONL-Outbox (bot-lesbar per Datei oder GET /api/bridge/outbox)
 # ---------------------------------------------------------------------------
 
+class Outbox:
+    """Append-only JSONL-Ausgangskorb mit monotonem Cursor.
+
+    Jeder Eintrag bekommt eine fortlaufende ``seq``. Leser merken sich die
+    zuletzt gelesene ``seq`` und fragen mit ``since=<seq>`` nur Neues ab.
+    Die Datei ist reines JSONL (eine Zeile pro Eintrag) und damit sowohl per
+    Datei als auch ueber den HTTP-Endpunkt von Bots lesbar.
+    """
+
+    def __init__(self, path: str, max_bytes: Optional[int] = None):
+        self.path = path
+        self.max_bytes = max_bytes or OUTBOX_MAX_BYTES
+        self._lock = threading.Lock()
+        self._seq: Optional[int] = None
+
+    def _last_seq(self) -> int:
+        last = 0
+        # Auch die rotierte Datei lesen, damit die seq nach Rotation und
+        # Neustart monoton bleibt.
+        for candidate in (self.path + ".1", self.path):
+            try:
+                with open(candidate, "r", encoding="utf-8") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        obj = _maybe_json(line)
+                        if isinstance(obj, dict):
+                            seq = obj.get("seq")
+                            if (isinstance(seq, int)
+                                    and not isinstance(seq, bool)
+                                    and seq > last):
+                                last = seq
+            except OSError:
+                continue
+        return last
+
+    def write(self, entry: Dict[str, Any]) -> Dict[str, Any]:
+        with self._lock:
+            if self._seq is None:
+                self._seq = self._last_seq()
+            self._seq += 1
+            record = dict(entry)
+            record["seq"] = self._seq
+            record.setdefault("ts", utc_now())
+            line = json.dumps(record, ensure_ascii=False, sort_keys=True)
+            data = (line + "\n").encode("utf-8")
+            try:
+                directory = os.path.dirname(self.path)
+                if directory:
+                    os.makedirs(directory, exist_ok=True)
+                try:
+                    size = os.path.getsize(self.path)
+                except OSError:
+                    size = 0
+                if size > 0 and size + len(data) > self.max_bytes:
+                    # Rotation nach Groesse: aktuelle Datei -> <name>.1.
+                    # Modus vor dem Rename haerten, damit auch eine alte,
+                    # noch mit weiter umask angelegte Datei als .1 0600 wird.
+                    try:
+                        os.chmod(self.path, 0o600)
+                    except OSError:
+                        pass
+                    os.replace(self.path, self.path + ".1")
+                # Modus 0600 per os.open anlegen; fchmod erzwingt den Modus
+                # unabhaengig von einer evtl. weiten umask.
+                fd = os.open(
+                    self.path,
+                    os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+                    0o600,
+                )
+                try:
+                    os.fchmod(fd, 0o600)
+                    os.write(fd, data)
+                finally:
+                    os.close(fd)
+            except OSError:
+                self._seq -= 1
+                raise
+            return record
+
+    def read(self, since: int = 0, limit: int = 200,
+             rigs: Optional[frozenset] = None
+             ) -> Tuple[List[Dict[str, Any]], int, bool]:
+        matches: List[Dict[str, Any]] = []
+        try:
+            with open(self.path, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    obj = _maybe_json(line)
+                    if not isinstance(obj, dict):
+                        continue
+                    seq = obj.get("seq")
+                    if not isinstance(seq, int) or isinstance(seq, bool) or seq <= since:
+                        continue
+                    if rigs is not None and obj.get("rig") not in rigs:
+                        continue
+                    matches.append(obj)
+        except OSError:
+            pass
+        has_more = len(matches) > limit
+        matches = matches[:limit]
+        cursor = since
+        if matches:
+            cursor = matches[-1].get("seq", since)
+        return matches, cursor, has_more
+
+
+# ---------------------------------------------------------------------------
+# Slack-Versand
+# ---------------------------------------------------------------------------
 def default_http_post(url: str, payload: Dict[str, Any], token: Optional[str] = None) -> str:
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, method="POST")
@@ -669,6 +799,7 @@ class Bridge:
                                     config.api_rate_window)
         self.dedupe = DedupeStore(self.state)
         self.route_table = RouteTable(config.routes_path)
+        self.outbox = Outbox(config.outbox_path)
 
     # -- subprocess --------------------------------------------------------
 
@@ -771,6 +902,8 @@ class Bridge:
         if action == "escalations" and method == "GET":
             return self._do_simple("escalations", identity, "escalations",
                                    ESCALATION_RIG_KEYS)
+        if action == "outbox" and method == "GET":
+            return self._do_outbox(identity, query)
         if action == "mail" and method == "POST":
             return self._do_mail(identity, body)
         if action == "nudge" and method == "POST":
@@ -925,6 +1058,41 @@ class Bridge:
         else:
             payload["format"] = "json"
             payload["data"] = data
+        return 200, payload
+
+    def _do_outbox(self, identity: Identity,
+                   query: Dict[str, str]) -> Tuple[int, Dict[str, Any]]:
+        """GET /api/bridge/outbox?since=<seq>&limit=<n>[&rig=<rig>]"""
+        since = _env_int(query.get("since"), 0)
+        if since < 0:
+            since = 0
+        limit = _env_int(query.get("limit"), 200)
+        limit = max(1, min(limit, 1000))
+
+        rig = query.get("rig")
+        rigs: Optional[frozenset] = None
+        if rig:
+            rig_val = validate_id(rig, "rig")
+            if not identity.allows_rig(rig_val):
+                return 403, {"ok": False, "error": "scope verweigert", "rig": rig_val}
+            rigs = frozenset({rig_val})
+        elif not identity.admin:
+            # Nicht-Admins sehen nur Eintraege ihrer Rigs (Town-Eintraege
+            # ohne rig bleiben Admin-only).
+            rigs = identity.rigs
+
+        entries, cursor, has_more = self.outbox.read(
+            since=since, limit=limit, rigs=rigs
+        )
+        payload: Dict[str, Any] = {
+            "ok": True,
+            "entries": entries,
+            "cursor": cursor,
+            "count": len(entries),
+            "has_more": has_more,
+        }
+        if rig:
+            payload["rig"] = rig
         return 200, payload
 
     def _do_simple(self, command_name: str, identity: Identity,
@@ -1244,46 +1412,85 @@ class OutboundPoller(threading.Thread):
 
     def handle_event(self, event: Dict[str, Any]) -> bool:
         bridge = self.bridge
-        etype = EVENT_TYPE_MAP.get(str(event.get("type", "")))
-        if not etype:
-            return False
+        raw_type = str(event.get("type", ""))
+        etype = EVENT_TYPE_MAP.get(raw_type)
 
         payload = event.get("payload") or {}
         if not isinstance(payload, dict):
             payload = {}
-        rig = payload.get("rig") or self._rig_for_event(event, payload)
 
-        bridge.route_table.reload_if_changed()
-        route = bridge.route_table.route_for(rig)
-        if not route:
-            LOG.info("Kein Slack-Route-Eintrag fuer rig=%s (Event %s)", rig, etype)
+        # Mail an den Overseer ist eine bot-lesbare Pflichtmeldung: sie landet
+        # immer in der Outbox, auch ohne Slack-Route (Cid/Ami-Anforderung).
+        if etype is None and raw_type == "mail" and self._is_overseer_mail(payload):
+            etype = "overseer_mail"
+        if not etype:
             return False
 
+        rig = payload.get("rig") or self._rig_for_event(event, payload)
         event_id = self._event_id(event, etype, payload)
+
         if not bridge.dedupe.first_seen(event_id):
             LOG.debug("Dedupe: Event %s bereits gesendet", event_id)
+            bridge.state.save()
             return False
 
+        bridge.route_table.reload_if_changed()
+        route = bridge.route_table.route_for(rig) or {}
+        text = self._format_message(etype, event, payload, route)
+
+        # 1) Immer in die JSONL-Outbox schreiben (bot-lesbar per Datei/API,
+        #    unabhaengig davon, ob Slack konfiguriert ist).
+        try:
+            bridge.outbox.write(
+                self._outbox_entry(etype, event, payload, rig, event_id, text)
+            )
+        except Exception as exc:  # noqa: BLE001 - Outbox-Fehler nicht fatal
+            LOG.warning("Outbox-Schreiben fehlgeschlagen: %s", exc)
+
+        # 2) Slack-Post nur, wenn eine Route mit channel existiert. Ohne
+        #    Credentials bleibt das ein Dry-run ins Log.
         channel = route.get("channel")
         if not channel:
-            LOG.info("Route fuer rig=%s hat keinen channel", rig)
-            return False
+            bridge.state.save()
+            LOG.info("Kein Slack-Route-Eintrag fuer rig=%s (Event %s)", rig, etype)
+            return True
 
         if not bridge.rate.allow(channel):
             bridge.state.save()
-            LOG.warning("Rate-Limit erreicht fuer %s, Event %s verworfen",
+            LOG.warning("Rate-Limit erreicht fuer %s, Slack-Post fuer %s verworfen",
                         channel, event_id)
-            return False
+            return True
         bridge.state.save()
 
-        text = self._format_message(etype, event, payload, route)
         try:
             result = bridge.notifier.send(channel, text, route.get("webhook_env"))
         except Exception as exc:  # noqa: BLE001 - Slack-Fehler nicht fatal
             LOG.warning("Slack-Versand fehlgeschlagen: %s", exc)
-            return False
+            return True
         LOG.info("Event %s (%s) -> %s via %s", event_id, etype, channel, result)
         return True
+
+    @staticmethod
+    def _is_overseer_mail(payload: Dict[str, Any]) -> bool:
+        to = payload.get("to")
+        if not isinstance(to, str):
+            return False
+        return to.strip().lower().rstrip("/") in OVERSEER_MAIL_RECIPIENTS
+
+    @staticmethod
+    def _outbox_entry(etype: str, event: Dict[str, Any],
+                      payload: Dict[str, Any], rig: Optional[str],
+                      event_id: str, text: str) -> Dict[str, Any]:
+        return {
+            "kind": etype,
+            "type": event.get("type"),
+            "actor": event.get("actor") or "",
+            "rig": rig,
+            "event_id": event_id,
+            "text": text,
+            "source": event.get("source") or "gt",
+            "payload": payload,
+        }
 
     def _rig_for_event(self, event: Dict[str, Any],
                        payload: Dict[str, Any]) -> Optional[str]:
@@ -1298,19 +1505,32 @@ class OutboundPoller(threading.Thread):
         return None
 
     @staticmethod
+    def _content_digest(etype: str, event: Dict[str, Any],
+                        payload: Dict[str, Any]) -> str:
+        """sha256 ueber kind+actor+subject+body/payload (ohne Zeitstempel)."""
+        subject = (payload.get("subject") or payload.get("title")
+                   or event.get("subject") or "")
+        body = payload.get("body") or payload.get("message") or ""
+        canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                               default=str)
+        raw = "\n".join([
+            str(etype),
+            str(event.get("actor") or ""),
+            str(subject),
+            str(body),
+            canonical,
+        ])
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    @staticmethod
     def _event_id(event: Dict[str, Any], etype: str,
                   payload: Dict[str, Any]) -> str:
         for key in ("id", "mr", "bead", "escalation", "session_id", "session"):
             value = payload.get(key)
             if value:
                 return f"{etype}:{key}:{value}"
-        raw = json.dumps(
-            {"type": event.get("type"), "ts": event.get("ts"),
-             "actor": event.get("actor"), "payload": payload},
-            sort_keys=True,
-        )
-        digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
-        return f"{etype}:{digest}"
+        digest = OutboundPoller._content_digest(etype, event, payload)
+        return f"{etype}:sha256:{digest}"
 
     @staticmethod
     def _format_message(etype: str, event: Dict[str, Any],
@@ -1331,6 +1551,7 @@ class OutboundPoller(threading.Thread):
             or payload.get("escalation")
             or payload.get("agent")
             or payload.get("session")
+            or payload.get("to")
             or ""
         )
         title = payload.get("title") or payload.get("subject") or ""
@@ -1443,8 +1664,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     bridge = Bridge(config)
 
     if args.check:
-        LOG.info("Konfiguration ok: %d Token, %d Routen, gt_root=%s",
-                 len(bridge.tokens._entries), len(bridge.routes), config.gt_root)
+        LOG.info("Konfiguration ok: %d Token, %d Routen, gt_root=%s, outbox=%s",
+                 len(bridge.tokens._entries), len(bridge.routes), config.gt_root,
+                 config.outbox_path)
         return 0
 
     if args.once:

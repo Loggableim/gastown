@@ -530,9 +530,13 @@ class OutboundTests(BridgeTestCase):
         ok2 = poller.handle_event({
             "type": "merged", "actor": "tiroltourismus/a",
             "payload": {"rig": "tiroltourismus", "mr": "2"}})
+        # Beide Events werden verarbeitet (in die Outbox geschrieben), aber
+        # nur eines darf das Rate-Limit passieren und nach Slack gehen.
         self.assertTrue(ok1)
-        self.assertFalse(ok2)
+        self.assertTrue(ok2)
         self.assertEqual(len(poster.calls), 1)
+        entries, _, _ = self.bridge.outbox.read()
+        self.assertEqual(len(entries), 2)
 
     def test_handle_event_unknown_type_ignored(self):
         poster = RecordingPoster()
@@ -704,6 +708,123 @@ class SecurityFixTests(BridgeTestCase):
                                     token=VALI_TOKEN)
         self.assertEqual(status, 200)
         self.assertEqual([e["id"] for e in payload["escalations"]], ["e1"])
+# ---------------------------------------------------------------------------
+# JSONL-Outbox
+# ---------------------------------------------------------------------------
+
+class OutboxTests(BridgeTestCase):
+    def test_write_assigns_monotonic_seq(self):
+        first = self.bridge.outbox.write({"kind": "escalation"})
+        second = self.bridge.outbox.write({"kind": "bead_done"})
+        self.assertEqual(first["seq"], 1)
+        self.assertEqual(second["seq"], 2)
+        self.assertIn("ts", first)
+
+    def test_read_since_cursor(self):
+        for i in range(3):
+            self.bridge.outbox.write({"kind": "pr_merged", "payload": {"mr": i}})
+        entries, cursor, has_more = self.bridge.outbox.read(since=0)
+        self.assertEqual([e["seq"] for e in entries], [1, 2, 3])
+        self.assertEqual(cursor, 3)
+        self.assertFalse(has_more)
+
+        entries, cursor, _ = self.bridge.outbox.read(since=2)
+        self.assertEqual([e["seq"] for e in entries], [3])
+        self.assertEqual(cursor, 3)
+
+    def test_read_limit_and_has_more(self):
+        for i in range(5):
+            self.bridge.outbox.write({"kind": "pr_merged"})
+        entries, cursor, has_more = self.bridge.outbox.read(since=0, limit=2)
+        self.assertEqual([e["seq"] for e in entries], [1, 2])
+        self.assertEqual(cursor, 2)
+        self.assertTrue(has_more)
+
+    def test_outbox_endpoint_admin(self):
+        self.bridge.outbox.write({"kind": "escalation", "rig": "tiroltourismus"})
+        status, payload = self.call("GET", "/api/bridge/outbox",
+                                    token=ADMIN_TOKEN)
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["count"], 1)
+        self.assertEqual(payload["cursor"], 1)
+        self.assertEqual(payload["entries"][0]["kind"], "escalation")
+
+    def test_outbox_endpoint_requires_auth(self):
+        status, _ = self.call("GET", "/api/bridge/outbox")
+        self.assertEqual(status, 401)
+
+    def test_outbox_endpoint_scope_filter(self):
+        self.bridge.outbox.write({"kind": "bead_done", "rig": "tiroltourismus"})
+        self.bridge.outbox.write({"kind": "bead_done", "rig": "fremdrig"})
+        self.bridge.outbox.write({"kind": "escalation", "rig": None})
+
+        status, payload = self.call("GET", "/api/bridge/outbox",
+                                    token=VALI_TOKEN)
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["count"], 1)
+        self.assertEqual(payload["entries"][0]["rig"], "tiroltourismus")
+
+    def test_outbox_endpoint_rig_out_of_scope_403(self):
+        status, _ = self.call("GET", "/api/bridge/outbox", token=VALI_TOKEN,
+                              query={"rig": "fremdrig"})
+        self.assertEqual(status, 403)
+
+    def test_outbox_endpoint_since_query(self):
+        self.bridge.outbox.write({"kind": "bead_done"})
+        self.bridge.outbox.write({"kind": "bead_done"})
+        status, payload = self.call("GET", "/api/bridge/outbox",
+                                    token=ADMIN_TOKEN, query={"since": "1"})
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["count"], 1)
+        self.assertEqual(payload["entries"][0]["seq"], 2)
+
+
+class OverseerMailTests(BridgeTestCase):
+    def _poller(self, poster=None):
+        self.bridge.notifier = gb.SlackNotifier(
+            self.config, poster=poster or RecordingPoster()
+        )
+        return gb.OutboundPoller(self.bridge, interval=1,
+                                 stop_event=__import__("threading").Event())
+
+    def test_overseer_mail_written_without_slack_route(self):
+        # Keine Slack-Routen konfiguriert -> trotzdem in der Outbox.
+        poller = self._poller()
+        handled = poller.handle_event({
+            "type": "mail",
+            "actor": "mayor",
+            "payload": {"to": "overseer", "subject": "Status"},
+        })
+        self.assertTrue(handled)
+        entries, _, _ = self.bridge.outbox.read()
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["kind"], "overseer_mail")
+        self.assertEqual(entries[0]["actor"], "mayor")
+        self.assertIn("Status", entries[0]["text"])
+
+    def test_regular_mail_not_outboxed(self):
+        poller = self._poller()
+        handled = poller.handle_event({
+            "type": "mail",
+            "actor": "mayor",
+            "payload": {"to": "tiroltourismus/witness", "subject": "x"},
+        })
+        self.assertFalse(handled)
+        entries, _, _ = self.bridge.outbox.read()
+        self.assertEqual(entries, [])
+
+    def test_event_without_route_still_outboxed(self):
+        # Erkanntes Event ohne Slack-Route landet weiterhin in der Outbox.
+        poller = self._poller()
+        handled = poller.handle_event({
+            "type": "merged", "actor": "tiroltourismus/polecat",
+            "payload": {"rig": "tiroltourismus", "mr": "mr-9"},
+        })
+        self.assertTrue(handled)
+        entries, _, _ = self.bridge.outbox.read()
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["kind"], "pr_merged")
+        self.assertEqual(entries[0]["rig"], "tiroltourismus")
 
     def test_status_real_townstatus_whitelisted_for_non_admin(self):
         # Echte Form aus internal/cmd/status.go (TownStatus).
@@ -794,6 +915,89 @@ class SecurityFixTests(BridgeTestCase):
                                     token=VALI_TOKEN)
         self.assertEqual(status, 403)
         self.assertFalse(payload["ok"])
+
+
+
+class OutboxHardeningTests(BridgeTestCase):
+    def _path(self):
+        return os.path.join(self.root, "outbox-hardening.jsonl")
+
+    def test_outbox_file_mode_0600(self):
+        path = self._path()
+        outbox = gb.Outbox(path)
+        outbox.write({"kind": "escalation"})
+        self.assertEqual(oct(os.stat(path).st_mode & 0o777), "0o600")
+
+    def test_outbox_rotation_creates_dot_one(self):
+        path = self._path()
+        outbox = gb.Outbox(path, max_bytes=200)
+        for i in range(20):
+            outbox.write({"kind": "pr_merged", "payload": {"mr": i},
+                          "pad": "x" * 60})
+        self.assertTrue(os.path.exists(path + ".1"))
+
+    def test_outbox_seq_monotonic_after_rotation_and_restart(self):
+        path = self._path()
+        outbox = gb.Outbox(path, max_bytes=200)
+        seqs = [outbox.write({"kind": "x", "pad": "y" * 60})["seq"]
+                for _ in range(20)]
+        self.assertEqual(seqs, list(range(1, 21)))
+        self.assertTrue(os.path.exists(path + ".1"))
+        # Neustart: neue Instanz liest die letzte seq auch aus .1.
+        restarted = gb.Outbox(path, max_bytes=200)
+        self.assertEqual(restarted.write({"kind": "x"})["seq"], 21)
+
+    def test_outbox_rotated_file_keeps_mode_0600(self):
+        path = self._path()
+        outbox = gb.Outbox(path, max_bytes=200)
+        for i in range(20):
+            outbox.write({"kind": "x", "pad": "y" * 60})
+        self.assertEqual(oct(os.stat(path).st_mode & 0o777), "0o600")
+        self.assertEqual(oct(os.stat(path + ".1").st_mode & 0o777), "0o600")
+
+    def test_outbox_legacy_0644_active_file_rotates_to_0600(self):
+        # Vor dem Fix angelegte aktive Datei (0644) darf als .1 nicht den
+        # weiten Altmodus behalten.
+        path = self._path()
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("x" * 180 + "\n")
+        os.chmod(path, 0o644)
+        outbox = gb.Outbox(path, max_bytes=100)
+        outbox.write({"kind": "x", "pad": "y" * 60})
+        self.assertTrue(os.path.exists(path + ".1"))
+        self.assertEqual(oct(os.stat(path + ".1").st_mode & 0o777), "0o600")
+
+    def test_event_id_content_hash_ignores_timestamp(self):
+        payload = {"rig": "tiroltourismus", "subject": "s", "body": "b"}
+        e1 = {"type": "mail", "ts": "2026-01-01T00:00:00Z",
+              "actor": "mayor", "payload": payload}
+        e2 = {"type": "mail", "ts": "2026-01-01T00:00:05Z",
+              "actor": "mayor", "payload": dict(payload)}
+        id1 = gb.OutboundPoller._event_id(e1, "overseer_mail", payload)
+        id2 = gb.OutboundPoller._event_id(e2, "overseer_mail", e2["payload"])
+        self.assertTrue(id1.startswith("overseer_mail:sha256:"))
+        self.assertEqual(id1, id2)
+
+    def test_event_id_content_hash_distinguishes_body(self):
+        ev = {"type": "mail", "ts": "t", "actor": "mayor"}
+        id1 = gb.OutboundPoller._event_id(
+            ev, "overseer_mail",
+            {"rig": "tiroltourismus", "subject": "s", "body": "b1"})
+        id2 = gb.OutboundPoller._event_id(
+            ev, "overseer_mail",
+            {"rig": "tiroltourismus", "subject": "s", "body": "b2"})
+        self.assertNotEqual(id1, id2)
+
+    def test_dedupe_by_content_not_timestamp(self):
+        payload = {"rig": "tiroltourismus", "subject": "s", "body": "b"}
+        first = gb.OutboundPoller._event_id(
+            {"type": "mail", "ts": "2026-01-01T00:00:00Z", "actor": "mayor"},
+            "overseer_mail", payload)
+        second = gb.OutboundPoller._event_id(
+            {"type": "mail", "ts": "2026-01-01T00:00:09Z", "actor": "mayor"},
+            "overseer_mail", payload)
+        self.assertTrue(self.bridge.dedupe.first_seen(first))
+        self.assertFalse(self.bridge.dedupe.first_seen(second))
 
 
 class TokenStoreTests(unittest.TestCase):
