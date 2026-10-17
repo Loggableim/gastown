@@ -35,6 +35,8 @@ const (
 	AgentAmp AgentPreset = "amp"
 	// AgentOpenCode is OpenCode multi-model CLI.
 	AgentOpenCode AgentPreset = "opencode"
+	// AgentKilo is Kilo Code CLI (an OpenCode fork with .kilo plugin loading).
+	AgentKilo AgentPreset = "kilo"
 	// AgentCopilot is GitHub Copilot CLI.
 	AgentCopilot AgentPreset = "copilot"
 	// AgentPi is Pi Coding Agent (extension-based lifecycle).
@@ -157,6 +159,11 @@ type AgentPresetInfo struct {
 	// false, a background nudge-poller process is started to periodically drain
 	// the queue and inject via tmux.
 	HasTurnBoundaryDrain bool `json:"has_turn_boundary_drain,omitempty"`
+
+	// AutoSubmitDelayMs, when greater than zero, sends an Enter keystroke this
+	// many milliseconds after the session starts. Some TUIs (Kilo Code) accept
+	// the initial prompt via --prompt but leave it unsubmitted until Enter.
+	AutoSubmitDelayMs int `json:"auto_submit_delay_ms,omitempty"`
 
 	// EscapeCancelsRequest indicates that sending an Escape keystroke to this
 	// agent cancels its in-flight generation. NudgeSession normally sends
@@ -382,6 +389,39 @@ var builtinPresets = map[AgentPreset]*AgentPresetInfo{
 		ACP: &ACPConfig{
 			Command: "acp",
 		},
+	},
+	AgentKilo: {
+		Name:    AgentKilo,
+		Command: "kilo",
+		Args:    []string{"--auto"}, // Auto-approve tool calls
+		Env: map[string]string{
+			// Kilo reads the same permission/config shape as OpenCode; set both
+			// names so either implementation sees the Gas Town defaults.
+			"KILO_PERMISSION":         `{"*":"allow"}`,
+			"KILO_CONFIG_CONTENT":     `{"lsp":true}`,
+			"OPENCODE_PERMISSION":     `{"*":"allow"}`,
+			"OPENCODE_CONFIG_CONTENT": `{"lsp":true}`,
+		},
+		ProcessNames:        []string{"kilo", "node", "bun"},
+		SessionIDEnv:        "", // Kilo/OpenCode manage sessions internally
+		ResumeFlag:          "",
+		ResumeStyle:         "",
+		SupportsHooks:       true, // Uses .kilo/plugins/gastown.js
+		SupportsForkSession: false,
+		NonInteractive: &NonInteractiveConfig{
+			Subcommand: "run",
+			OutputFlag: "--format json",
+		},
+		// Runtime defaults
+		PromptMode:        "arg", // Delivered via --prompt by BuildCommandWithPrompt
+		ConfigDir:         ".kilo",
+		HooksProvider:     "kilo", // Resolves to the OpenCode plugin template
+		HooksDir:          ".kilo/plugins",
+		HooksSettingsFile: "gastown.js",
+		ReadyDelayMs:      8000,
+		// Kilo's TUI does not submit the initial --prompt automatically.
+		AutoSubmitDelayMs: 12000,
+		InstructionsFile:  "AGENTS.md",
 	},
 	AgentCopilot: {
 		Name:                AgentCopilot,

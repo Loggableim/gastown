@@ -1028,3 +1028,40 @@ func TestEnsureSettingsForRole_ProvisionCommandsOutsideTownRoot(t *testing.T) {
 		t.Error("no commands provisioned in workDir outside town root, want at least one")
 	}
 }
+
+type fakeEnterKeySession struct {
+	keys chan string
+}
+
+func (f *fakeEnterKeySession) SendKeysRaw(_ string, keys string) error {
+	f.keys <- keys
+	return nil
+}
+
+func TestScheduleAutoSubmitSendsEnter(t *testing.T) {
+	fake := &fakeEnterKeySession{keys: make(chan string, 1)}
+	rc := &config.RuntimeConfig{AutoSubmitDelayMs: 1}
+
+	ScheduleAutoSubmit(fake, "sess-1", rc)
+
+	select {
+	case got := <-fake.keys:
+		if got != "Enter" {
+			t.Fatalf("SendKeysRaw keys = %q, want Enter", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ScheduleAutoSubmit did not send Enter")
+	}
+}
+
+func TestScheduleAutoSubmitNoOpWhenDisabled(t *testing.T) {
+	fake := &fakeEnterKeySession{keys: make(chan string, 1)}
+
+	ScheduleAutoSubmit(fake, "sess-1", &config.RuntimeConfig{AutoSubmitDelayMs: 0})
+
+	select {
+	case got := <-fake.keys:
+		t.Fatalf("SendKeysRaw unexpectedly called with %q", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+}

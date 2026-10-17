@@ -213,6 +213,7 @@ func StartSession(t *tmux.Tmux, cfg SessionConfig) (_ *StartResult, retErr error
 	if err := t.NewSessionWithCommandAndEnv(cfg.SessionID, cfg.WorkDir, command, envVars); err != nil {
 		return nil, fmt.Errorf("creating session: %w", err)
 	}
+	runtime.ScheduleAutoSubmit(t, cfg.SessionID, runtimeConfig)
 
 	// 6. Set remain-on-exit immediately if requested (before anything else can fail).
 	if cfg.RemainOnExit {

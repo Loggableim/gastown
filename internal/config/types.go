@@ -50,7 +50,7 @@ type TownSettings struct {
 	CLITheme string `json:"cli_theme,omitempty"`
 
 	// DefaultAgent is the name of the agent preset to use by default.
-	// Can be a built-in preset ("claude", "gemini", "codex", "cursor", "auggie", "amp", "opencode", "copilot")
+	// Can be a built-in preset ("claude", "gemini", "codex", "cursor", "auggie", "amp", "opencode", "kilo", "copilot")
 	// or a custom agent name defined in settings/agents.json.
 	// Default: "claude"
 	DefaultAgent string `json:"default_agent,omitempty"`
@@ -678,7 +678,7 @@ type RigSettings struct {
 	Runtime    *RuntimeConfig    `json:"runtime,omitempty"`     // LLM runtime settings (deprecated: use Agent)
 
 	// Agent selects which agent preset to use for this rig.
-	// Can be a built-in preset ("claude", "gemini", "codex", "cursor", "auggie", "amp", "opencode", "copilot")
+	// Can be a built-in preset ("claude", "gemini", "codex", "cursor", "auggie", "amp", "opencode", "kilo", "copilot")
 	// or a custom agent defined in settings/agents.json.
 	// If empty, uses the town's default_agent setting.
 	// Takes precedence over Runtime if both are set.
@@ -754,6 +754,11 @@ type RuntimeConfig struct {
 	// Supported values: "arg" (append prompt arg), "none" (ignore prompt).
 	// Default: "arg" for claude/generic, "none" for codex.
 	PromptMode string `json:"prompt_mode,omitempty"`
+
+	// AutoSubmitDelayMs, when greater than zero, sends an Enter keystroke this
+	// many milliseconds after startup so TUIs that leave the initial prompt
+	// unsubmitted (e.g. Kilo Code) begin working.
+	AutoSubmitDelayMs int `json:"auto_submit_delay_ms,omitempty"`
 
 	// Session config controls environment integration for runtime session IDs.
 	Session *RuntimeSessionConfig `json:"session,omitempty"`
@@ -885,10 +890,11 @@ func (rc *RuntimeConfig) BuildCommandWithPrompt(prompt string) string {
 		return base
 	}
 
-	// OpenCode requires --prompt flag for initial prompt in interactive mode.
-	// Positional argument causes opencode to exit immediately.
-	// Match both "opencode" and full paths like "/home/user/.opencode/bin/opencode".
-	if resolved.Command == "opencode" || filepath.Base(resolved.Command) == "opencode" {
+	// OpenCode/Kilo require --prompt for the initial prompt in interactive mode.
+	// Positional argument causes opencode to exit immediately (and Kilo treats it
+	// as a project directory, leading to ENAMETOOLONG for long prompts).
+	// Match both bare names and full paths like "/home/user/.opencode/bin/opencode".
+	if isOpenCodeFamilyCommand(resolved.Command) {
 		return base + " --prompt " + quoteForShell(p)
 	}
 
@@ -919,10 +925,10 @@ func (rc *RuntimeConfig) BuildArgsWithPrompt(prompt string) []string {
 	}
 
 	if p != "" && resolved.PromptMode != "none" {
-		switch resolved.Command {
-		case "opencode":
+		switch {
+		case isOpenCodeFamilyCommand(resolved.Command):
 			args = append(args, "--prompt", p)
-		case "copilot", "gemini":
+		case resolved.Command == "copilot" || resolved.Command == "gemini":
 			args = append(args, "-i", p)
 		default:
 			args = append(args, p)
@@ -932,6 +938,13 @@ func (rc *RuntimeConfig) BuildArgsWithPrompt(prompt string) []string {
 	}
 
 	return args
+}
+
+// isOpenCodeFamilyCommand reports whether command is OpenCode or a closely
+// related fork (Kilo) that uses the same --prompt interactive startup flag.
+func isOpenCodeFamilyCommand(command string) bool {
+	base := filepath.Base(command)
+	return base == "opencode" || base == "kilo"
 }
 
 func normalizeRuntimeConfig(rc *RuntimeConfig) *RuntimeConfig {
@@ -975,6 +988,10 @@ func normalizeRuntimeConfig(rc *RuntimeConfig) *RuntimeConfig {
 
 	if rc.PromptMode == "" {
 		rc.PromptMode = defaultPromptMode(rc.Provider)
+	}
+
+	if rc.AutoSubmitDelayMs == 0 {
+		rc.AutoSubmitDelayMs = defaultAutoSubmitDelayMs(rc.Provider)
 	}
 
 	if rc.Session == nil {
@@ -1091,6 +1108,13 @@ func defaultPromptMode(provider string) string {
 		return preset.PromptMode
 	}
 	return "arg"
+}
+
+func defaultAutoSubmitDelayMs(provider string) int {
+	if preset := GetAgentPresetByName(provider); preset != nil {
+		return preset.AutoSubmitDelayMs
+	}
+	return 0
 }
 
 func defaultSessionIDEnv(provider string) string {

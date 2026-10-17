@@ -842,6 +842,7 @@ func (m *Manager) Start(name string, opts StartOptions) error {
 	if err := t.NewSessionWithCommandAndEnv(sessionID, worker.ClonePath, claudeCmd, envVars); err != nil {
 		return fmt.Errorf("creating session: %w", err)
 	}
+	runtime.ScheduleAutoSubmit(t, sessionID, runtimeConfig)
 
 	// Record agent's pane_id for ZFC-compliant liveness checks (gt-qmsx).
 	if paneID, err := t.GetPaneID(sessionID); err == nil {

@@ -231,6 +231,7 @@ func (m *Manager) Start(foreground bool, agentOverride string) error {
 	if err := t.NewSessionWithCommandAndEnv(sessionID, refineryRigDir, command, envVars); err != nil {
 		return fmt.Errorf("creating tmux session: %w", err)
 	}
+	runtime.ScheduleAutoSubmit(t, sessionID, runtimeConfig)
 
 	// Apply theme (non-fatal: theming failure doesn't affect operation)
 	theme := tmux.ResolveSessionTheme(townRoot, m.rig.Name, "refinery", "")

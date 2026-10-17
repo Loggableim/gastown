@@ -16,6 +16,7 @@ import (
 	"github.com/steveyegge/gastown/internal/constants"
 	gtgit "github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/rig"
+	"github.com/steveyegge/gastown/internal/runtime"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/util"
@@ -410,6 +411,7 @@ func (d *Daemon) restartSession(sessionName, identity string) error {
 		}
 		return fmt.Errorf("creating session: %w", err)
 	}
+	runtime.ScheduleAutoSubmit(d.tmux, sessionName, rc)
 
 	// Set environment variables in tmux session table (for debugging/monitoring tools).
 	d.setSessionEnvironment(sessionName, roleConfig, parsed)

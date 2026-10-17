@@ -327,6 +327,26 @@ func DeliverStartupPromptFallback(
 	return nil
 }
 
+// enterKeySession is the minimal tmux surface needed to submit a prompt.
+type enterKeySession interface {
+	SendKeysRaw(session, keys string) error
+}
+
+// ScheduleAutoSubmit arranges for an Enter keystroke to be sent to the session
+// after the runtime's configured AutoSubmitDelayMs. Some TUIs (Kilo Code) accept
+// the initial prompt as a CLI argument but do not submit it until the user
+// presses Enter. Runs in the background so session startup is not blocked.
+func ScheduleAutoSubmit(t enterKeySession, sessionID string, rc *config.RuntimeConfig) {
+	if t == nil || sessionID == "" || rc == nil || rc.AutoSubmitDelayMs <= 0 {
+		return
+	}
+	delay := time.Duration(rc.AutoSubmitDelayMs) * time.Millisecond
+	go func() {
+		time.Sleep(delay)
+		_ = t.SendKeysRaw(sessionID, "Enter")
+	}()
+}
+
 // StartupNudgeContent returns the work instructions to send as a startup nudge.
 func StartupNudgeContent() string {
 	return "Check your hook with `" + cli.Name() + " hook`. If work is present, begin immediately."

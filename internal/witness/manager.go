@@ -239,6 +239,7 @@ func (m *Manager) Start(foreground bool, agentOverride string, envOverrides []st
 	if err := t.NewSessionWithCommandAndEnv(sessionID, witnessDir, command, envVars); err != nil {
 		return fmt.Errorf("creating tmux session: %w", err)
 	}
+	runtime.ScheduleAutoSubmit(t, sessionID, runtimeConfig)
 
 	// Apply Gas Town theming (non-fatal: theming failure doesn't affect operation)
 	theme := tmux.ResolveSessionTheme(townRoot, m.rig.Name, "witness", "")

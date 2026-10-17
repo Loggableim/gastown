@@ -740,3 +740,31 @@ func TestTemplateContentEqual(t *testing.T) {
 		t.Error("expected invalid JSON to not match")
 	}
 }
+
+// TestInstallForRole_KiloReusesOpenCodeTemplate verifies the Kilo preset
+// installs the OpenCode gastown.js plugin template under .kilo/plugins
+// (Kilo only loads plugins from .kilo/).
+func TestInstallForRole_KiloReusesOpenCodeTemplate(t *testing.T) {
+	dir := t.TempDir()
+
+	if err := InstallForRole("kilo", dir, dir, "crew", ".kilo/plugins", "gastown.js", false); err != nil {
+		t.Fatalf("InstallForRole(kilo): %v", err)
+	}
+
+	kiloPath := filepath.Join(dir, ".kilo/plugins", "gastown.js")
+	got, err := os.ReadFile(kiloPath)
+	if err != nil {
+		t.Fatalf("kilo gastown.js not installed at .kilo/plugins: %v", err)
+	}
+	want, err := resolveAndSubstitute("opencode", "gastown.js", "crew")
+	if err != nil {
+		t.Fatalf("resolveAndSubstitute(opencode): %v", err)
+	}
+	if string(got) != string(want) {
+		t.Fatal("kilo plugin does not match the OpenCode gastown.js template")
+	}
+
+	if _, err := os.Stat(filepath.Join(dir, ".opencode/plugins", "gastown.js")); err == nil {
+		t.Error("kilo install unexpectedly wrote to .opencode/plugins")
+	}
+}

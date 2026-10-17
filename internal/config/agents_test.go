@@ -1776,3 +1776,79 @@ func TestACPModeConstants(t *testing.T) {
 		t.Errorf("ACPModeFlag = %q, want flag", ACPModeFlag)
 	}
 }
+
+// TestKiloAgentPreset verifies the built-in Kilo Code preset: it runs
+// `kilo --auto`, shares OpenCode's permission/config env vars under both the
+// KILO_* and OPENCODE_* names, installs the OpenCode gastown.js plugin under
+// .kilo/plugins, and declares an auto-submit Enter delay because Kilo's TUI
+// does not submit the --prompt argument automatically.
+func TestKiloAgentPreset(t *testing.T) {
+	t.Parallel()
+
+	info := GetAgentPreset(AgentKilo)
+	if info == nil {
+		t.Fatal("GetAgentPreset(AgentKilo) returned nil")
+	}
+	if info.Command != "kilo" {
+		t.Errorf("Command = %q, want kilo", info.Command)
+	}
+	if len(info.Args) != 1 || info.Args[0] != "--auto" {
+		t.Errorf("Args = %v, want [--auto]", info.Args)
+	}
+	if got := strings.Join(info.ProcessNames, ","); got != "kilo,node,bun" {
+		t.Errorf("ProcessNames = %q, want kilo,node,bun", got)
+	}
+	for _, key := range []string{"KILO_PERMISSION", "KILO_CONFIG_CONTENT", "OPENCODE_PERMISSION", "OPENCODE_CONFIG_CONTENT"} {
+		if info.Env[key] == "" {
+			t.Errorf("Env[%s] is empty, want value", key)
+		}
+	}
+	if info.HooksProvider != "kilo" {
+		t.Errorf("HooksProvider = %q, want kilo", info.HooksProvider)
+	}
+	if info.HooksDir != ".kilo/plugins" {
+		t.Errorf("HooksDir = %q, want .kilo/plugins", info.HooksDir)
+	}
+	if info.HooksSettingsFile != "gastown.js" {
+		t.Errorf("HooksSettingsFile = %q, want gastown.js", info.HooksSettingsFile)
+	}
+	if info.ConfigDir != ".kilo" {
+		t.Errorf("ConfigDir = %q, want .kilo", info.ConfigDir)
+	}
+	if info.PromptMode != "arg" {
+		t.Errorf("PromptMode = %q, want arg", info.PromptMode)
+	}
+	if info.AutoSubmitDelayMs <= 0 {
+		t.Errorf("AutoSubmitDelayMs = %d, want > 0", info.AutoSubmitDelayMs)
+	}
+}
+
+func TestKiloPresetBuildCommandWithPrompt(t *testing.T) {
+	t.Parallel()
+
+	rc := RuntimeConfigFromPreset(AgentKilo)
+	cmd := rc.BuildCommandWithPrompt("hello world")
+	if !strings.Contains(cmd, "kilo") {
+		t.Fatalf("command = %q, want kilo", cmd)
+	}
+	if !strings.Contains(cmd, "--auto") {
+		t.Errorf("command = %q, want --auto", cmd)
+	}
+	if !strings.Contains(cmd, "--prompt") {
+		t.Errorf("command = %q, want --prompt flag for the initial prompt", cmd)
+	}
+
+	args := rc.BuildArgsWithPrompt("hello world")
+	if len(args) < 3 || args[0] != "kilo" {
+		t.Fatalf("args = %v, want leading kilo", args)
+	}
+	foundPrompt := false
+	for i, a := range args {
+		if a == "--prompt" && i+1 < len(args) && args[i+1] == "hello world" {
+			foundPrompt = true
+		}
+	}
+	if !foundPrompt {
+		t.Errorf("args = %v, want --prompt hello world", args)
+	}
+}

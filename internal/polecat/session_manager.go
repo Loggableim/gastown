@@ -503,6 +503,7 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 	if err := m.tmux.NewSessionWithCommandAndEnv(sessionID, workDir, command, envVars); err != nil {
 		return fmt.Errorf("creating session: %w", err)
 	}
+	runtime.ScheduleAutoSubmit(m.tmux, sessionID, runtimeConfig)
 
 	// Record agent's pane_id for ZFC-compliant liveness checks (gt-qmsx).
 	// Declared pane identity replaces process-tree inference in IsRuntimeRunning

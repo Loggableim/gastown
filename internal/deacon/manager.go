@@ -139,6 +139,7 @@ func (m *Manager) Start(agentOverride string) error {
 	if err := t.NewSessionWithCommandAndEnv(sessionID, deaconDir, startupCmd, envVars); err != nil {
 		return fmt.Errorf("creating tmux session: %w", err)
 	}
+	runtime.ScheduleAutoSubmit(t, sessionID, runtimeConfig)
 
 	// PATCH-010: Set remain-on-exit IMMEDIATELY after session creation.
 	// This ensures the pane stays if Claude exits before hooks are fully set.

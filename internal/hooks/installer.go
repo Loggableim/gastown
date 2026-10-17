@@ -202,6 +202,12 @@ func writeTemplate(provider, role, hooksFile, targetPath string) error {
 
 // resolveTemplate finds the right template for a provider+role combination.
 func resolveTemplate(provider, hooksFile, role string) ([]byte, error) {
+	// Kilo Code is an OpenCode fork and loads the same plugin API. Reuse the
+	// OpenCode gastown.js template instead of keeping a drifting duplicate.
+	if provider == "kilo" {
+		provider = "opencode"
+	}
+
 	// Determine role type
 	autonomous := hookutil.IsAutonomousRole(role)
 

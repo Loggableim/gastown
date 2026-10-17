@@ -1866,11 +1866,12 @@ func fillRuntimeDefaults(rc *RuntimeConfig) *RuntimeConfig {
 
 	// Create result with scalar fields (strings are immutable in Go)
 	result := &RuntimeConfig{
-		Provider:      rc.Provider,
-		Command:       rc.Command,
-		InitialPrompt: rc.InitialPrompt,
-		PromptMode:    rc.PromptMode,
-		ResolvedAgent: rc.ResolvedAgent,
+		Provider:          rc.Provider,
+		Command:           rc.Command,
+		InitialPrompt:     rc.InitialPrompt,
+		PromptMode:        rc.PromptMode,
+		AutoSubmitDelayMs: rc.AutoSubmitDelayMs,
+		ResolvedAgent:     rc.ResolvedAgent,
 	}
 
 	// Deep copy Args slice to avoid sharing backing array
@@ -1987,6 +1988,11 @@ func fillRuntimeDefaults(rc *RuntimeConfig) *RuntimeConfig {
 	// Auto-fill PromptMode from preset.
 	if result.PromptMode == "" && preset != nil && preset.PromptMode != "" {
 		result.PromptMode = preset.PromptMode
+	}
+
+	// Auto-fill auto-submit delay from preset (Kilo Code).
+	if result.AutoSubmitDelayMs == 0 && preset != nil && preset.AutoSubmitDelayMs > 0 {
+		result.AutoSubmitDelayMs = preset.AutoSubmitDelayMs
 	}
 
 	// Auto-fill Instructions defaults from preset.
