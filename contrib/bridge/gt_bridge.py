@@ -70,7 +70,7 @@ COMMANDS: Dict[str, Any] = {
 
     # Schreibende Befehle.
     "mail_send": ["gt", "mail", "send", "$to", "-s", "$subject", "-m", "$body"],
-    "nudge": ["gt", "nudge", "$target", "$message"],
+    "nudge": ["gt", "nudge", "$target", "--", "$message"],
     # gt nudge kennt --mode mit wait-idle (Default), queue und immediate.
     "nudge_mode_flag": "--mode",
     "sling": ["gt", "sling", "$bead", "$rig"],
@@ -195,6 +195,10 @@ def validate_id(value: Any, field_name: str) -> str:
         raise ValidationError(f"{field_name} ist zu lang")
     if v.startswith("-"):
         raise ValidationError(f"{field_name} darf nicht mit '-' beginnen")
+    if v.startswith("/"):
+        raise ValidationError(f"{field_name} darf nicht mit '/' beginnen")
+    if ".." in v.split("/"):
+        raise ValidationError(f"{field_name} darf keine '..'-Segmente enthalten")
     if not ID_RE.match(v):
         raise ValidationError(
             f"{field_name} enthaelt unerlaubte Zeichen (erlaubt: A-Za-z0-9._/-)"
@@ -240,6 +244,8 @@ class Config:
     poll_interval: int = 60
     rate_limit: int = 10
     rate_window: int = 600
+    api_rate_limit: int = 60
+    api_rate_window: int = 60
     timeout: int = 60
     slack_webhook_url: str = ""
     slack_bot_token: str = ""
@@ -288,6 +294,8 @@ class Config:
         cfg.poll_interval = _env_int(cfg.get("GT_BRIDGE_POLL_INTERVAL"), 60)
         cfg.rate_limit = _env_int(cfg.get("GT_BRIDGE_RATE_LIMIT"), 10)
         cfg.rate_window = _env_int(cfg.get("GT_BRIDGE_RATE_WINDOW"), 600)
+        cfg.api_rate_limit = _env_int(cfg.get("GT_BRIDGE_API_RATE_LIMIT"), 60)
+        cfg.api_rate_window = _env_int(cfg.get("GT_BRIDGE_API_RATE_WINDOW"), 60)
         cfg.timeout = _env_int(cfg.get("GT_BRIDGE_TIMEOUT"), 60)
         cfg.slack_webhook_url = cfg.get("SLACK_WEBHOOK_URL", "")
         cfg.slack_bot_token = cfg.get("SLACK_BOT_TOKEN", "")
@@ -651,6 +659,8 @@ class Bridge:
         self.notifier = notifier or SlackNotifier(config)
         self.state = StateStore(config.state_path)
         self.rate = RateLimiter(self.state, config.rate_limit, config.rate_window)
+        self.api_rate = RateLimiter(self.state, config.api_rate_limit,
+                                    config.api_rate_window)
         self.dedupe = DedupeStore(self.state)
         self.route_table = RouteTable(config.routes_path)
 
@@ -715,6 +725,10 @@ class Bridge:
         audit["identity"] = identity.name
         audit["admin"] = identity.admin
 
+        if not self.api_rate.allow("api:" + identity.name):
+            self.audit.write({**audit, "status": 429, "action": "rate_limit"})
+            return 429, {"ok": False, "error": "rate limit exceeded"}
+
         relative = path[len(PREFIX):].strip("/")
         parts = [p for p in relative.split("/") if p]
         action = parts[0] if parts else ""
@@ -761,12 +775,91 @@ class Bridge:
 
     # -- Endpunkte ---------------------------------------------------------
 
+    @staticmethod
+    def _town_wide_denied(label: str = "") -> Tuple[int, Dict[str, Any]]:
+        payload: Dict[str, Any] = {
+            "ok": False,
+            "error": "town-weite Abfrage nur fuer Admin",
+        }
+        if label:
+            payload["endpoint"] = label
+        return 403, payload
+
+    def _filter_for_identity(self, data: Any, identity: Identity
+                             ) -> Tuple[Any, bool]:
+        """Filtert Rig-bezogene Daten auf die Rigs der Identitaet.
+
+        Rueckgabe (gefiltert, ok). ok=False -> nicht sauber filterbar; der
+        Aufrufer antwortet dann mit 403 (town-weite Abfrage).
+        """
+        if identity.admin:
+            return data, True
+        if isinstance(data, list):
+            filtered, any_attr = self._filter_items(data, identity)
+            if data and not any_attr:
+                return None, False
+            return filtered, True
+        if isinstance(data, dict):
+            out: Dict[str, Any] = {}
+            any_attr = False
+            for key, value in data.items():
+                if isinstance(value, list):
+                    if not value:
+                        out[key] = value
+                        continue
+                    if all(isinstance(item, dict) for item in value):
+                        filtered, attr = self._filter_items(value, identity)
+                        out[key] = filtered
+                        any_attr = any_attr or attr
+                    else:
+                        return None, False
+                else:
+                    out[key] = value
+            if not any_attr:
+                return None, False
+            return out, True
+        return None, False
+
+    def _filter_items(self, items: List[Any], identity: Identity
+                      ) -> Tuple[List[Any], bool]:
+        filtered: List[Any] = []
+        any_attr = False
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            rig = self._item_rig(item)
+            if rig is None:
+                continue
+            any_attr = True
+            if identity.allows_rig(rig):
+                filtered.append(item)
+        return filtered, any_attr
+
+    def _item_rig(self, item: Dict[str, Any]) -> Optional[str]:
+        rig = item.get("rig")
+        if isinstance(rig, str) and rig:
+            return rig
+        bead = item.get("bead")
+        if isinstance(bead, str) and bead:
+            bead_rig = rig_for_bead(self.routes, bead)
+            if bead_rig:
+                return bead_rig
+        for key in ("actor", "address", "name", "target", "to", "agent"):
+            value = item.get(key)
+            if isinstance(value, str) and value:
+                addr_rig = rig_from_address(value)
+                if addr_rig:
+                    return addr_rig
+        return None
+
     def _do_status(self, identity: Identity) -> Tuple[int, Dict[str, Any]]:
         data, raw, rc = self._run_json(COMMANDS["status"])
         if rc != 0:
             # Fallback: Textausgabe.
             cp = self._run(COMMANDS["status_text"])
             if cp.returncode == 0:
+                if not identity.admin:
+                    return self._town_wide_denied("status")
                 return 200, {
                     "ok": True,
                     "identity": identity.name,
@@ -776,7 +869,14 @@ class Bridge:
             return 502, {"ok": False, "error": "gt status fehlgeschlagen",
                          "stderr": (cp.stderr or "").strip()}
         if data is None:
+            if not identity.admin:
+                return self._town_wide_denied("status")
             return 200, {"ok": True, "format": "text", "data": raw}
+        if not identity.admin:
+            filtered, ok = self._filter_for_identity(data, identity)
+            if not ok:
+                return self._town_wide_denied("status")
+            data = filtered
         return 200, {"ok": True, "format": "json", "data": data}
 
     def _do_ready(self, identity: Identity,
@@ -813,7 +913,14 @@ class Bridge:
         if rc != 0:
             return 502, {"ok": False, "error": f"{command_name} fehlgeschlagen"}
         if data is None:
+            if not identity.admin:
+                return self._town_wide_denied(label)
             return 200, {"ok": True, label: raw, "format": "text"}
+        if not identity.admin:
+            filtered, ok = self._filter_for_identity(data, identity)
+            if not ok:
+                return self._town_wide_denied(label)
+            data = filtered
         return 200, {"ok": True, label: data, "format": "json"}
 
     def _do_mail(self, identity: Identity,
@@ -852,7 +959,9 @@ class Bridge:
                 raise ValidationError(
                     "mode muss einer von " + ", ".join(sorted(NUDGE_MODES)) + " sein"
                 )
-            argv += [COMMANDS["nudge_mode_flag"], mode]
+            # Flags stehen vor dem '--', das die Nachricht schuetzt.
+            idx = argv.index("--")
+            argv[idx:idx] = [COMMANDS["nudge_mode_flag"], mode]
         cp = self._run(argv)
         if cp.returncode != 0:
             return 502, {"ok": False, "error": "gt nudge fehlgeschlagen",

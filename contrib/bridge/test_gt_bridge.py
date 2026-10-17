@@ -242,7 +242,7 @@ class CommandTests(BridgeTestCase):
         self.assertEqual(status, 200)
         self.assertEqual(
             self.runner.last_argv(),
-            ["gt", "nudge", "tiroltourismus/polecat", "status?"],
+            ["gt", "nudge", "tiroltourismus/polecat", "--", "status?"],
         )
 
     def test_nudge_mode_immediate_argv(self):
@@ -256,7 +256,8 @@ class CommandTests(BridgeTestCase):
         self.assertEqual(payload["mode"], "immediate")
         self.assertEqual(
             self.runner.last_argv(),
-            ["gt", "nudge", "tiroltourismus/polecat", "los", "--mode", "immediate"],
+            ["gt", "nudge", "tiroltourismus/polecat",
+             "--mode", "immediate", "--", "los"],
         )
 
     def test_nudge_default_mode_wait_idle(self):
@@ -571,6 +572,138 @@ class OutboundTests(BridgeTestCase):
         })
         self.assertTrue(handled)
         self.assertEqual(poster.calls[0]["payload"]["channel"], "#tirol-content")
+
+
+
+# ---------------------------------------------------------------------------
+# Sicherheitsfixes (gt-w38): validate_id, nudge --, Rate-Limit, Rig-Filter
+# ---------------------------------------------------------------------------
+
+class SecurityFixTests(BridgeTestCase):
+    def test_validate_id_rejects_dotdot_segments(self):
+        for bad in ("..", "../etc", "a/../b", "rig/..", "tiroltourismus/../../x"):
+            with self.assertRaises(gb.ValidationError):
+                gb.validate_id(bad, "id")
+
+    def test_validate_id_rejects_leading_slash(self):
+        for bad in ("/etc/passwd", "/tiroltourismus", "/"):
+            with self.assertRaises(gb.ValidationError):
+                gb.validate_id(bad, "id")
+
+    def test_validate_id_accepts_normal_ids(self):
+        self.assertEqual(gb.validate_id("tiroltourismus/polecat", "id"),
+                         "tiroltourismus/polecat")
+        self.assertEqual(gb.validate_id("tt-123", "id"), "tt-123")
+
+    def test_nudge_puts_double_dash_before_message(self):
+        self.runner.when(["gt", "nudge", "tiroltourismus/polecat"])
+        status, _ = self.call(
+            "POST", "/api/bridge/nudge", token=VALI_TOKEN,
+            body={"target": "tiroltourismus/polecat", "message": "--help"},
+        )
+        self.assertEqual(status, 200)
+        argv = self.runner.last_argv()
+        self.assertEqual(
+            argv,
+            ["gt", "nudge", "tiroltourismus/polecat", "--", "--help"],
+        )
+        self.assertLess(argv.index("--"), argv.index("--help"))
+
+    def test_nudge_mode_flag_precedes_double_dash(self):
+        self.runner.when(["gt", "nudge", "tiroltourismus/polecat"])
+        status, _ = self.call(
+            "POST", "/api/bridge/nudge", token=VALI_TOKEN,
+            body={"target": "tiroltourismus/polecat", "message": "los",
+                  "mode": "queue"},
+        )
+        self.assertEqual(status, 200)
+        argv = self.runner.last_argv()
+        self.assertEqual(
+            argv,
+            ["gt", "nudge", "tiroltourismus/polecat",
+             "--mode", "queue", "--", "los"],
+        )
+        self.assertLess(argv.index("--mode"), argv.index("--"))
+
+    def test_api_rate_limit_returns_429(self):
+        self.bridge.api_rate = gb.RateLimiter(self.bridge.state, 2, 60)
+        self.runner.when(["gt", "status", "--json"], rc=0,
+                         stdout=json.dumps({"name": "town"}), stderr="")
+        s1, _ = self.call("GET", "/api/bridge/status", token=ADMIN_TOKEN)
+        s2, _ = self.call("GET", "/api/bridge/status", token=ADMIN_TOKEN)
+        s3, p3 = self.call("GET", "/api/bridge/status", token=ADMIN_TOKEN)
+        self.assertEqual([s1, s2, s3], [200, 200, 429])
+        self.assertFalse(p3["ok"])
+
+    def test_api_rate_limit_is_per_token(self):
+        self.bridge.api_rate = gb.RateLimiter(self.bridge.state, 1, 60)
+        self.runner.when(["gt", "status", "--json"], rc=0,
+                         stdout=json.dumps({"name": "town"}), stderr="")
+        s_admin, _ = self.call("GET", "/api/bridge/status", token=ADMIN_TOKEN)
+        s_vali, _ = self.call("GET", "/api/bridge/status", token=VALI_TOKEN)
+        # Eigene Buckets pro Token: der zweite Token ist noch nicht limitiert.
+        self.assertEqual(s_admin, 200)
+        self.assertIn(s_vali, (200, 403))
+
+    def test_status_filtered_for_non_admin(self):
+        status_data = {
+            "name": "town",
+            "agents": [
+                {"address": "tiroltourismus/polecat", "rig": "tiroltourismus"},
+                {"address": "fremdrig/polecat", "rig": "fremdrig"},
+            ],
+            "rigs": [
+                {"name": "tiroltourismus"},
+                {"name": "fremdrig"},
+            ],
+        }
+        self.runner.when(["gt", "status", "--json"], rc=0,
+                         stdout=json.dumps(status_data), stderr="")
+        status, payload = self.call("GET", "/api/bridge/status", token=VALI_TOKEN)
+        self.assertEqual(status, 200)
+        data = payload["data"]
+        self.assertEqual([a["address"] for a in data["agents"]],
+                         ["tiroltourismus/polecat"])
+        self.assertEqual([r["name"] for r in data["rigs"]], ["tiroltourismus"])
+
+    def test_status_town_wide_denied_for_non_admin(self):
+        self.runner.when(["gt", "status", "--json"], rc=0,
+                         stdout=json.dumps({"name": "town"}), stderr="")
+        status, payload = self.call("GET", "/api/bridge/status", token=VALI_TOKEN)
+        self.assertEqual(status, 403)
+        self.assertFalse(payload["ok"])
+
+    def test_convoys_filtered_for_non_admin(self):
+        convoy_data = {"convoys": [
+            {"id": "c1", "rig": "tiroltourismus"},
+            {"id": "c2", "rig": "fremdrig"},
+        ]}
+        self.runner.when(["gt", "convoy", "list", "--json"], rc=0,
+                         stdout=json.dumps(convoy_data), stderr="")
+        status, payload = self.call("GET", "/api/bridge/convoys", token=VALI_TOKEN)
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [c["id"] for c in payload["convoys"]["convoys"]], ["c1"])
+
+    def test_escalations_town_wide_denied_for_non_admin(self):
+        self.runner.when(["gt", "escalate", "list", "--json"], rc=0,
+                         stdout=json.dumps({"escalations": [{"id": "e1"}]}),
+                         stderr="")
+        status, payload = self.call("GET", "/api/bridge/escalations",
+                                    token=VALI_TOKEN)
+        self.assertEqual(status, 403)
+        self.assertFalse(payload["ok"])
+
+    def test_escalations_filtered_by_rig(self):
+        self.runner.when(["gt", "escalate", "list", "--json"], rc=0,
+                         stdout=json.dumps([
+                             {"id": "e1", "rig": "tiroltourismus"},
+                             {"id": "e2", "rig": "fremdrig"},
+                         ]), stderr="")
+        status, payload = self.call("GET", "/api/bridge/escalations",
+                                    token=VALI_TOKEN)
+        self.assertEqual(status, 200)
+        self.assertEqual([e["id"] for e in payload["escalations"]], ["e1"])
 
 
 class TokenStoreTests(unittest.TestCase):
