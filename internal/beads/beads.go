@@ -451,6 +451,30 @@ func (b *Beads) getResolvedBeadsDir() string {
 	return ResolveBeadsDir(b.workDir)
 }
 
+// bdRunDir returns the working directory a bd subprocess should run in so that
+// the subprocess resolves the same project as BEADS_DIR.
+//
+// bd 1.0.x resolves .beads/metadata.json relative to the current working
+// directory (walking up from cwd) as well as honoring BEADS_DIR. When a wrapper
+// is constructed with a workDir that is not the owner of the resolved .beads
+// (e.g. NewWithBeadsDir(townRoot, rigBeadsDir)), running bd from workDir could
+// read the town's metadata.json while the env selects the rig's database, which
+// makes bd refuse to connect with PROJECT IDENTITY MISMATCH.
+//
+// Running bd from the parent of the resolved .beads directory (the rig/project
+// root) makes the subprocess behave exactly like `cd <rig> && bd ...`.
+func (b *Beads) bdRunDir() string {
+	beadsDir := b.getResolvedBeadsDir()
+	if beadsDir == "" {
+		return b.workDir
+	}
+	owner := filepath.Dir(beadsDir)
+	if owner == "" || owner == "." {
+		return b.workDir
+	}
+	return owner
+}
+
 // targetBeadsDirForCreate returns the database a create operation should use.
 // Rig is authoritative for MR/conflict-task creates; otherwise parent-prefixed
 // children should land beside their parent so bd can resolve the relationship.
@@ -585,7 +609,9 @@ func (b *Beads) runWithStdin(stdinData []byte, args ...string) (_ []byte, retErr
 	// resolve from working directory.
 	cmd := exec.CommandContext(ctx, "bd", fullArgs...) //nolint:gosec // G204: bd is a trusted internal tool
 	util.SetDetachedProcessGroup(cmd)
-	cmd.Dir = b.workDir
+	// Run from the owner of the resolved .beads directory (the rig/project
+	// root) so bd's cwd-based metadata.json discovery matches BEADS_DIR.
+	cmd.Dir = b.bdRunDir()
 
 	cmd.Env = runEnv
 	cmd.Env = append(cmd.Env, telemetry.OTELEnvForSubprocess()...)
@@ -612,7 +638,7 @@ func (b *Beads) runWithStdin(stdinData []byte, args ...string) (_ []byte, retErr
 		stderr.Reset()
 		cmd = exec.CommandContext(ctx, "bd", retryArgs...) //nolint:gosec // G204: bd is a trusted internal tool
 		util.SetDetachedProcessGroup(cmd)
-		cmd.Dir = b.workDir
+		cmd.Dir = b.bdRunDir()
 		cmd.Env = runEnv
 		cmd.Env = append(cmd.Env, telemetry.OTELEnvForSubprocess()...)
 		cmd.Stdout = &stdout

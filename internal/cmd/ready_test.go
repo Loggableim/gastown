@@ -268,11 +268,19 @@ fi
 case "$*" in
   *"mol wisp list"*) printf '{"wisps":[],"count":0}\n'; exit 0;;
   *ready*)
-    if [ "${BEADS_DOLT_SERVER_DATABASE:-}" = "ti" ]; then
-      printf '[{"id":"ti-4ng","title":"Rig work","priority":2,"issue_type":"task"}]\n'
-    else
+    if [ "${BEADS_DOLT_SERVER_DATABASE:-}" != "ti" ]; then
       printf '[{"id":"hq-999","title":"Wrong database","priority":2,"issue_type":"task"}]\n'
+      exit 0
     fi
+    # bd resolves .beads/metadata.json from cwd, so a rig query must run from
+    # the rig root (parent of BEADS_DIR). Otherwise bd reads the town metadata
+    # while the env selects the rig database and refuses with PROJECT IDENTITY
+    # MISMATCH.
+    if [ "$PWD" != "$(dirname "${BEADS_DIR:-}")" ]; then
+      printf 'PROJECT IDENTITY MISMATCH: cwd=%s beads_dir=%s\n' "$PWD" "${BEADS_DIR:-}" >&2
+      exit 1
+    fi
+    printf '[{"id":"ti-4ng","title":"Rig work","priority":2,"issue_type":"task"}]\n'
     exit 0;;
   *) printf '[]\n'; exit 0;;
 esac

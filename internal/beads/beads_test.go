@@ -4085,3 +4085,92 @@ func TestShouldThrottleBDRead(t *testing.T) {
 		})
 	}
 }
+
+// TestRunRunsBDFromBeadsOwnerDir is a regression test for PROJECT IDENTITY
+// MISMATCH errors on rig queries. A wrapper can be built with a workDir that is
+// not the owner of the resolved .beads directory (e.g. the town root while
+// BEADS_DIR points at a rig). bd resolves .beads/metadata.json from cwd, so
+// running from the town root made bd read the town's metadata while the env
+// selected the rig's database, and bd refused to connect. run() must therefore
+// execute bd from the parent of the resolved .beads directory.
+func TestRunRunsBDFromBeadsOwnerDir(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses Unix shell script bd stub")
+	}
+
+	ResetBdAllowStaleCacheForTest()
+	t.Cleanup(ResetBdAllowStaleCacheForTest)
+
+	townRoot := t.TempDir()
+	townBeads := filepath.Join(townRoot, ".beads")
+	if err := os.MkdirAll(townBeads, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(townBeads, "metadata.json"),
+		[]byte(`{"backend":"dolt","dolt_mode":"server","dolt_database":"hq","project_id":"e0fe97ce"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	rigRoot := filepath.Join(townRoot, "tiroltourismus")
+	rigBeads := filepath.Join(rigRoot, ".beads")
+	if err := os.MkdirAll(rigBeads, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rigBeads, "metadata.json"),
+		[]byte(`{"backend":"dolt","dolt_mode":"server","dolt_database":"tiroltourismus","project_id":"340b5bde"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	stubDir := t.TempDir()
+	stubPath := filepath.Join(stubDir, "bd")
+	// Emulates bd 1.0.x project-identity verification: bd finds the nearest
+	// .beads/metadata.json by walking up from cwd and refuses to connect when
+	// its project_id differs from the database selected by
+	// BEADS_DOLT_SERVER_DATABASE.
+	script := `#!/bin/sh
+if [ "$1" = "--allow-stale" ]; then
+  echo "Error: unknown flag: --allow-stale" >&2
+  exit 0
+fi
+dir="$PWD"
+meta=""
+while [ "$dir" != "/" ] && [ -n "$dir" ]; do
+  if [ -f "$dir/.beads/metadata.json" ]; then
+    meta="$dir/.beads/metadata.json"
+    break
+  fi
+  dir=$(dirname "$dir")
+done
+case "$meta" in
+  */tiroltourismus/.beads/metadata.json) got="340b5bde";;
+  */.beads/metadata.json) got="e0fe97ce";;
+  *) got="";;
+esac
+case "${BEADS_DOLT_SERVER_DATABASE:-}" in
+  tiroltourismus) want="340b5bde";;
+  hq) want="e0fe97ce";;
+  *) want="";;
+esac
+if [ -n "$want" ] && [ -n "$got" ] && [ "$want" != "$got" ]; then
+  echo "PROJECT IDENTITY MISMATCH: local $got database $want (cwd=$PWD)" >&2
+  exit 1
+fi
+printf '[{"id":"ti-4ng","title":"Rig work","priority":2,"issue_type":"task"}]\n'
+`
+	if err := os.WriteFile(stubPath, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", stubDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	// Stale ambient selector that must not win over the rig metadata database.
+	t.Setenv("BEADS_DOLT_SERVER_DATABASE", "hq")
+
+	// Wrapper whose workDir is the town root but whose database is the rig.
+	b := NewWithBeadsDir(townRoot, rigBeads)
+	issues, err := b.Ready()
+	if err != nil {
+		t.Fatalf("Ready from rig beads dir failed: %v", err)
+	}
+	if len(issues) != 1 || issues[0].ID != "ti-4ng" {
+		t.Fatalf("Ready IDs = %+v, want [ti-4ng]", issues)
+	}
+}
