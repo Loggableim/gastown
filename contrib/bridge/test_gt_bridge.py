@@ -705,6 +705,96 @@ class SecurityFixTests(BridgeTestCase):
         self.assertEqual(status, 200)
         self.assertEqual([e["id"] for e in payload["escalations"]], ["e1"])
 
+    def test_status_real_townstatus_whitelisted_for_non_admin(self):
+        # Echte Form aus internal/cmd/status.go (TownStatus).
+        town_status = {
+            "name": "tiroltown",
+            "location": "/home/human/gt",
+            "overseer": {"name": "Human Operator",
+                         "email": "boss@example.com", "username": "boss",
+                         "source": "config", "unread_mail": 7},
+            "daemon": {"running": True, "pid": 1234},
+            "dolt": {"running": True, "port": 3306,
+                     "data_dir": "/home/human/gt/.dolt-data"},
+            "tmux": {"socket": "gt-tiroltown",
+                     "socket_path": "/tmp/tmux-501/gt-tiroltown",
+                     "running": True, "session_count": 9},
+            "acp": {"running": False},
+            "agents": [
+                {"name": "mayor", "address": "mayor", "role": "mayor"},
+                {"name": "witness", "address": "tiroltourismus/witness",
+                 "role": "witness"},
+                {"name": "polecat", "address": "fremdrig/polecat",
+                 "role": "polecat"},
+            ],
+            "rigs": [
+                {"name": "tiroltourismus", "polecat_count": 3,
+                 "agents": [{"name": "witness",
+                             "address": "tiroltourismus/witness"}]},
+                {"name": "fremdrig", "polecat_count": 2},
+            ],
+            "summary": {"rig_count": 2, "polecat_count": 15, "crew_count": 4,
+                        "witness_count": 2, "refinery_count": 2,
+                        "active_hooks": 11},
+        }
+        self.runner.when(["gt", "status", "--json"], rc=0,
+                         stdout=json.dumps(town_status), stderr="")
+        status, payload = self.call("GET", "/api/bridge/status",
+                                    token=VALI_TOKEN)
+        self.assertEqual(status, 200)
+        data = payload["data"]
+        # Whitelist: nur rig-bezogene Felder duerfen ankommen.
+        self.assertEqual(set(data.keys()), {"rigs", "agents"})
+        self.assertEqual([r["name"] for r in data["rigs"]],
+                         ["tiroltourismus"])
+        self.assertEqual([a["address"] for a in data["agents"]],
+                         ["tiroltourismus/witness"])
+        blob = json.dumps(payload)
+        for leaked in ("boss@example.com", "Human Operator",
+                       "unread_mail", ".dolt-data", "socket_path",
+                       "rig_count", "session_count", "/home/human/gt",
+                       "fremdrig", "tiroltown"):
+            self.assertNotIn(leaked, blob)
+
+    def test_status_unknown_dict_form_denied_for_non_admin(self):
+        # Liste unter nicht erlaubtem Top-Level-Schluessel -> unbekannt -> 403.
+        self.runner.when(
+            ["gt", "status", "--json"], rc=0,
+            stdout=json.dumps({"rigs": [{"name": "tiroltourismus"}],
+                               "mystery": [{"x": 1}]}), stderr="")
+        status, payload = self.call("GET", "/api/bridge/status",
+                                    token=VALI_TOKEN)
+        self.assertEqual(status, 403)
+        self.assertFalse(payload["ok"])
+
+    def test_status_whitelist_key_wrong_type_denied(self):
+        self.runner.when(["gt", "status", "--json"], rc=0,
+                         stdout=json.dumps({"rigs": "tiroltourismus"}),
+                         stderr="")
+        status, payload = self.call("GET", "/api/bridge/status",
+                                    token=VALI_TOKEN)
+        self.assertEqual(status, 403)
+        self.assertFalse(payload["ok"])
+
+    def test_convoys_real_bare_array_denied_for_non_admin(self):
+        # gt convoy list --json liefert real ein nacktes Array ohne rig-Feld.
+        self.runner.when(["gt", "convoy", "list", "--json"], rc=0,
+                         stdout=json.dumps([{"id": "c1", "title": "x"}]),
+                         stderr="")
+        status, payload = self.call("GET", "/api/bridge/convoys",
+                                    token=VALI_TOKEN)
+        self.assertEqual(status, 403)
+        self.assertFalse(payload["ok"])
+
+    def test_escalations_real_bare_array_denied_for_non_admin(self):
+        # gt escalate list --json liefert real ein nacktes []beads.Issue.
+        self.runner.when(["gt", "escalate", "list", "--json"], rc=0,
+                         stdout=json.dumps([{"id": "e1"}]), stderr="")
+        status, payload = self.call("GET", "/api/bridge/escalations",
+                                    token=VALI_TOKEN)
+        self.assertEqual(status, 403)
+        self.assertFalse(payload["ok"])
+
 
 class TokenStoreTests(unittest.TestCase):
     def test_admin_and_scopes(self):

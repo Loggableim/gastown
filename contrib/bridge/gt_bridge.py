@@ -86,6 +86,12 @@ COMMANDS: Dict[str, Any] = {
 NUDGE_MODES = {"wait-idle", "queue", "immediate"}
 DEFAULT_NUDGE_MODE = "wait-idle"
 
+# Whitelist rig-bezogener Top-Level-Schluessel fuer Nicht-Admin-Antworten.
+# Nur diese Felder werden aus den jeweiligen CLI-Antworten durchgelassen.
+STATUS_RIG_KEYS: Tuple[str, ...] = ("rigs", "agents")
+CONVOY_RIG_KEYS: Tuple[str, ...] = ("convoys",)
+ESCALATION_RIG_KEYS: Tuple[str, ...] = ("escalations",)
+
 # Mapping gt-Event-Typ (events.go) -> Bruecken-Event-Typ.
 # Konfigurierbar/erweiterbar, wenn neue Event-Typen dazukommen.
 EVENT_TYPE_MAP: Dict[str, str] = {
@@ -760,9 +766,11 @@ class Bridge:
         if action == "ready" and method == "GET":
             return self._do_ready(identity, query)
         if action == "convoys" and method == "GET":
-            return self._do_simple("convoy_list", identity, "convoys")
+            return self._do_simple("convoy_list", identity, "convoys",
+                                   CONVOY_RIG_KEYS)
         if action == "escalations" and method == "GET":
-            return self._do_simple("escalations", identity, "escalations")
+            return self._do_simple("escalations", identity, "escalations",
+                                   ESCALATION_RIG_KEYS)
         if action == "mail" and method == "POST":
             return self._do_mail(identity, body)
         if action == "nudge" and method == "POST":
@@ -785,12 +793,19 @@ class Bridge:
             payload["endpoint"] = label
         return 403, payload
 
-    def _filter_for_identity(self, data: Any, identity: Identity
+    def _filter_for_identity(self, data: Any, identity: Identity,
+                             allowed_keys: Tuple[str, ...] = ()
                              ) -> Tuple[Any, bool]:
         """Filtert Rig-bezogene Daten auf die Rigs der Identitaet.
 
-        Rueckgabe (gefiltert, ok). ok=False -> nicht sauber filterbar; der
-        Aufrufer antwortet dann mit 403 (town-weite Abfrage).
+        Whitelist-Prinzip: Bei einem Dict werden fuer Nicht-Admin nur die in
+        ``allowed_keys`` genannten rig-bezogenen Listen uebernommen und auf
+        die eigenen Rigs reduziert. Alle uebrigen Top-Level-Felder (z. B.
+        ``overseer``, ``summary``, ``dolt``, ``tmux``, ``location``) werden
+        verworfen, damit keine town-weiten Metadaten bzw. PII durchsickern.
+
+        Rueckgabe (gefiltert, ok). ok=False -> unbekannte Form oder keine
+        Rig-Attribution; der Aufrufer antwortet dann mit 403.
         """
         if identity.admin:
             return data, True
@@ -802,19 +817,23 @@ class Bridge:
         if isinstance(data, dict):
             out: Dict[str, Any] = {}
             any_attr = False
+            for key in allowed_keys:
+                if key not in data:
+                    continue
+                value = data[key]
+                if not isinstance(value, list):
+                    return None, False
+                if value and not all(isinstance(item, dict) for item in value):
+                    return None, False
+                filtered, attr = self._filter_items(value, identity)
+                out[key] = filtered
+                any_attr = any_attr or attr
+            # Listen unter nicht erlaubten Schluesseln -> unbekannte Form.
             for key, value in data.items():
+                if key in allowed_keys:
+                    continue
                 if isinstance(value, list):
-                    if not value:
-                        out[key] = value
-                        continue
-                    if all(isinstance(item, dict) for item in value):
-                        filtered, attr = self._filter_items(value, identity)
-                        out[key] = filtered
-                        any_attr = any_attr or attr
-                    else:
-                        return None, False
-                else:
-                    out[key] = value
+                    return None, False
             if not any_attr:
                 return None, False
             return out, True
@@ -873,7 +892,8 @@ class Bridge:
                 return self._town_wide_denied("status")
             return 200, {"ok": True, "format": "text", "data": raw}
         if not identity.admin:
-            filtered, ok = self._filter_for_identity(data, identity)
+            filtered, ok = self._filter_for_identity(data, identity,
+                                                     STATUS_RIG_KEYS)
             if not ok:
                 return self._town_wide_denied("status")
             data = filtered
@@ -908,7 +928,8 @@ class Bridge:
         return 200, payload
 
     def _do_simple(self, command_name: str, identity: Identity,
-                   label: str) -> Tuple[int, Dict[str, Any]]:
+                   label: str, allowed_keys: Tuple[str, ...] = ()
+                   ) -> Tuple[int, Dict[str, Any]]:
         data, raw, rc = self._run_json(COMMANDS[command_name])
         if rc != 0:
             return 502, {"ok": False, "error": f"{command_name} fehlgeschlagen"}
@@ -917,7 +938,8 @@ class Bridge:
                 return self._town_wide_denied(label)
             return 200, {"ok": True, label: raw, "format": "text"}
         if not identity.admin:
-            filtered, ok = self._filter_for_identity(data, identity)
+            filtered, ok = self._filter_for_identity(data, identity,
+                                                     allowed_keys)
             if not ok:
                 return self._town_wide_denied(label)
             data = filtered
