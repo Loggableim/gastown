@@ -1907,6 +1907,8 @@ func TestHasBusyIndicator(t *testing.T) {
 	}{
 		{"claude status busy", "⏵⏵ bypass permissions on ... · esc to interrupt", true},
 		{"codex status busy", "• Working (2m 18s • esc to interrupt)", true},
+		{"kilo status busy", "■■■■■⬝⬝⬝  esc interrupt                         54.2K (5%)  ctrl+p commands", true},
+		{"kilo status idle", "40.4K (4%) · $0.01  ctrl+p commands", false},
 		{"idle line", "› Review ready notification", false},
 		{"blank", "", false},
 	}
@@ -1917,6 +1919,134 @@ func TestHasBusyIndicator(t *testing.T) {
 				t.Errorf("hasBusyIndicator(%q) = %v, want %v", tt.line, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestBusyIndicators pins the busy markers both variants of the interrupt hint
+// depend on. Kilo Code/OpenCode render "esc interrupt"; Claude/Codex/Gemini
+// render "esc to interrupt". A silent removal would break idle detection for
+// every busy-indicator-only agent.
+func TestBusyIndicators(t *testing.T) {
+	t.Parallel()
+
+	markers := map[string]bool{}
+	for _, m := range busyIndicators {
+		if strings.TrimSpace(m) == "" {
+			t.Fatal("busyIndicators must not contain empty markers")
+		}
+		markers[m] = true
+	}
+	for _, want := range []string{"esc to interrupt", "esc interrupt"} {
+		if !markers[want] {
+			t.Errorf("busyIndicators missing %q", want)
+		}
+	}
+}
+
+// TestIdleDetectionForSession verifies the per-agent idle-detection resolution
+// that nudge wait-idle and the queue poller rely on: prompt-prefix agents match
+// a prompt, Kilo uses busy-indicator mode, and agents with neither fall back to
+// the default prompt prefix (legacy behavior, effectively queue-only).
+func TestIdleDetectionForSession(t *testing.T) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		t.Skip("test requires unix")
+	}
+	tm := newTestTmux(t)
+
+	tests := []struct {
+		name       string
+		agent      string
+		wantPrompt string
+		wantBusy   bool
+	}{
+		{"kilo busy-indicator mode", "kilo", "", true},
+		{"claude prompt prefix", "claude", "❯ ", false},
+		{"opencode fallback", "opencode", DefaultReadyPromptPrefix, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sessionName := fmt.Sprintf("gt-test-idleagent-%s-%d", tt.agent, time.Now().UnixNano())
+			if err := tm.NewSessionWithCommandAndEnv(sessionName, os.TempDir(), "sleep 30",
+				map[string]string{"GT_AGENT": tt.agent}); err != nil {
+				t.Fatalf("NewSessionWithCommandAndEnv: %v", err)
+			}
+			defer func() { _ = tm.KillSession(sessionName) }()
+
+			prompt, busy := idleDetectionForSession(tm, sessionName)
+			if prompt != tt.wantPrompt {
+				t.Errorf("promptPrefix = %q, want %q", prompt, tt.wantPrompt)
+			}
+			if busy != tt.wantBusy {
+				t.Errorf("busyIndicatorIdle = %v, want %v", busy, tt.wantBusy)
+			}
+		})
+	}
+}
+
+// TestWaitForIdle_KiloBusyIndicator is the regression test for Kilo nudge
+// delivery: Kilo has no ready-prompt prefix, so idle must be inferred from the
+// absence of the "esc interrupt" busy hint. The idle footer must read as idle
+// and the busy footer must not.
+func TestWaitForIdle_KiloBusyIndicator(t *testing.T) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		t.Skip("test requires unix")
+	}
+	tm := newTestTmux(t)
+
+	idleName := fmt.Sprintf("gt-test-kilo-idle-%d", time.Now().UnixNano())
+	if err := tm.NewSessionWithCommandAndEnv(idleName, os.TempDir(),
+		"echo '40.4K (4%) · $0.01  ctrl+p commands'; sleep 60",
+		map[string]string{"GT_AGENT": "kilo"}); err != nil {
+		t.Fatalf("NewSessionWithCommandAndEnv(idle): %v", err)
+	}
+	defer func() { _ = tm.KillSession(idleName) }()
+
+	if err := tm.WaitForIdle(idleName, 2*time.Second); err != nil {
+		t.Errorf("WaitForIdle(idle kilo) = %v, want nil (no busy hint → idle)", err)
+	}
+	if !tm.IsIdle(idleName) {
+		t.Error("IsIdle(idle kilo) = false, want true")
+	}
+
+	busyName := fmt.Sprintf("gt-test-kilo-busy-%d", time.Now().UnixNano())
+	if err := tm.NewSessionWithCommandAndEnv(busyName, os.TempDir(),
+		"echo '■■■■■⬝⬝⬝  esc interrupt                         54.2K (5%)  ctrl+p commands'; sleep 60",
+		map[string]string{"GT_AGENT": "kilo"}); err != nil {
+		t.Fatalf("NewSessionWithCommandAndEnv(busy): %v", err)
+	}
+	defer func() { _ = tm.KillSession(busyName) }()
+
+	if err := tm.WaitForIdle(busyName, 700*time.Millisecond); err == nil {
+		t.Error("WaitForIdle(busy kilo) = nil, want timeout (busy hint present)")
+	} else if !errors.Is(err, ErrIdleTimeout) {
+		t.Errorf("WaitForIdle(busy kilo) = %v, want ErrIdleTimeout", err)
+	}
+	if tm.IsIdle(busyName) {
+		t.Error("IsIdle(busy kilo) = true, want false")
+	}
+}
+
+// TestWaitForIdle_NoDetectionAgentFallsBack ensures agents without any idle
+// detection (e.g. opencode) keep the legacy behavior: the idle footer does not
+// match the default "❯ " prompt, so WaitForIdle still times out. This guards
+// against accidentally enabling busy-indicator mode for every prefix-less agent.
+func TestWaitForIdle_NoDetectionAgentFallsBack(t *testing.T) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		t.Skip("test requires unix")
+	}
+	tm := newTestTmux(t)
+
+	sessionName := fmt.Sprintf("gt-test-opencode-idle-%d", time.Now().UnixNano())
+	if err := tm.NewSessionWithCommandAndEnv(sessionName, os.TempDir(),
+		"echo '40.4K (4%) · $0.01  ctrl+p commands'; sleep 60",
+		map[string]string{"GT_AGENT": "opencode"}); err != nil {
+		t.Fatalf("NewSessionWithCommandAndEnv: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+
+	if err := tm.WaitForIdle(sessionName, 700*time.Millisecond); !errors.Is(err, ErrIdleTimeout) {
+		t.Errorf("WaitForIdle(opencode) = %v, want ErrIdleTimeout (no idle detection)", err)
 	}
 }
 
