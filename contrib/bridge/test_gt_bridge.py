@@ -955,6 +955,18 @@ class OutboxHardeningTests(BridgeTestCase):
         self.assertEqual(oct(os.stat(path).st_mode & 0o777), "0o600")
         self.assertEqual(oct(os.stat(path + ".1").st_mode & 0o777), "0o600")
 
+    def test_outbox_legacy_0644_active_file_rotates_to_0600(self):
+        # Vor dem Fix angelegte aktive Datei (0644) darf als .1 nicht den
+        # weiten Altmodus behalten.
+        path = self._path()
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("x" * 180 + "\n")
+        os.chmod(path, 0o644)
+        outbox = gb.Outbox(path, max_bytes=100)
+        outbox.write({"kind": "x", "pad": "y" * 60})
+        self.assertTrue(os.path.exists(path + ".1"))
+        self.assertEqual(oct(os.stat(path + ".1").st_mode & 0o777), "0o600")
+
     def test_event_id_content_hash_ignores_timestamp(self):
         payload = {"rig": "tiroltourismus", "subject": "s", "body": "b"}
         e1 = {"type": "mail", "ts": "2026-01-01T00:00:00Z",

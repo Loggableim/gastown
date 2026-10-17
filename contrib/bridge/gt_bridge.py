@@ -634,6 +634,12 @@ class Outbox:
                     size = 0
                 if size > 0 and size + len(data) > self.max_bytes:
                     # Rotation nach Groesse: aktuelle Datei -> <name>.1.
+                    # Modus vor dem Rename haerten, damit auch eine alte,
+                    # noch mit weiter umask angelegte Datei als .1 0600 wird.
+                    try:
+                        os.chmod(self.path, 0o600)
+                    except OSError:
+                        pass
                     os.replace(self.path, self.path + ".1")
                 # Modus 0600 per os.open anlegen; fchmod erzwingt den Modus
                 # unabhaengig von einer evtl. weiten umask.
