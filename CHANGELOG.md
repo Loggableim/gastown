@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`gt done` accepts an already-merged commit after main moves** (sk-b9f).
+  The no-MR path required HEAD to equal the remote tip of the default branch.
+  Once other actors advanced main, an ancestor commit failed `verified_push`
+  even though `git merge-base --is-ancestor` succeeded. That path now checks
+  containment. Post-push verification still requires an exact tip.
+
 ## [1.2.1] - 2026-06-06
 
 ### Fixed

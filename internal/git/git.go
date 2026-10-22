@@ -1934,6 +1934,41 @@ func (g *Git) VerifyPushedCommit(remote, branch, commit string) error {
 	return nil
 }
 
+// VerifyCommitOnBranch verifies that commit is contained in the push-target
+// branch. Unlike VerifyPushedCommit, the remote tip may be a descendant of
+// commit. gt done uses this on the no-MR path: the work is already on the
+// default branch, and other actors advance the tip before the polecat exits
+// (sk-b9f). A missing branch, or a commit that is not an ancestor of the tip,
+// still fails. That is the stale-push case exact-tip verification also catches.
+func (g *Git) VerifyCommitOnBranch(remote, branch, commit string) error {
+	commit = strings.TrimSpace(commit)
+	if commit == "" {
+		return fmt.Errorf("verified_push_failed: empty commit for %s/%s", remote, branch)
+	}
+	tip, err := g.PushRemoteBranchTip(remote, branch)
+	if err != nil {
+		return fmt.Errorf("verified_push_failed: unable to read %s/%s: %w", remote, branch, err)
+	}
+	if tip == "" {
+		return fmt.Errorf("verified_push_failed: branch %s/%s missing (expected %s)", remote, branch, shortSHA(commit))
+	}
+	if tip == commit {
+		return nil
+	}
+	// The tip SHA came from ls-remote. Fetch so the ancestry check can see a
+	// tip that landed after our last local fetch. A fetch failure leaves the
+	// ancestry check to report a missing object.
+	_ = g.Fetch(remote)
+	onBranch, ancErr := g.IsAncestor(commit, tip)
+	if ancErr != nil {
+		return fmt.Errorf("verified_push_failed: commit %s not on %s/%s (remote tip %s): %w", shortSHA(commit), remote, branch, shortSHA(tip), ancErr)
+	}
+	if !onBranch {
+		return fmt.Errorf("verified_push_failed: commit %s not on %s/%s (remote tip %s)", shortSHA(commit), remote, branch, shortSHA(tip))
+	}
+	return nil
+}
+
 func parseLSRemoteTip(out, branch string) string {
 	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
 		line = strings.TrimSpace(line)

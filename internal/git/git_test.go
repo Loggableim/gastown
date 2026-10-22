@@ -2966,6 +2966,70 @@ func TestVerifyPushedCommitSplitURL(t *testing.T) {
 	}
 }
 
+func TestVerifyCommitOnBranch(t *testing.T) {
+	localDir, _, mainBranch := initTestRepoWithRemote(t)
+	g := NewGit(localDir)
+
+	ancestor, err := g.Rev("HEAD")
+	if err != nil {
+		t.Fatalf("Rev ancestor: %v", err)
+	}
+	if err := g.VerifyCommitOnBranch("origin", mainBranch, ancestor); err != nil {
+		t.Fatalf("tip equality: %v", err)
+	}
+	if err := g.VerifyCommitOnBranch("origin", mainBranch, ""); err == nil {
+		t.Fatal("empty commit should fail")
+	}
+	if err := g.VerifyCommitOnBranch("origin", "missing-branch", ancestor); err == nil {
+		t.Fatal("missing branch should fail")
+	}
+
+	// Other actors advance the default branch. The already-merged commit is
+	// an ancestor of the new tip and must still verify (sk-b9f).
+	if err := os.WriteFile(filepath.Join(localDir, "later.txt"), []byte("later\n"), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := g.Add("later.txt"); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if err := g.Commit("later tip"); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if err := g.Push("origin", mainBranch, false); err != nil {
+		t.Fatalf("Push later: %v", err)
+	}
+	if err := g.VerifyCommitOnBranch("origin", mainBranch, ancestor); err != nil {
+		t.Fatalf("ancestor of moved tip: %v", err)
+	}
+	if err := g.VerifyPushedCommit("origin", mainBranch, ancestor); err == nil {
+		t.Fatal("exact-tip verification must still reject an ancestor once the tip moves")
+	}
+
+	// A commit that was never pushed is not contained in the remote tip.
+	if err := g.CreateBranch("polecat/not-pushed"); err != nil {
+		t.Fatalf("CreateBranch: %v", err)
+	}
+	if err := g.Checkout("polecat/not-pushed"); err != nil {
+		t.Fatalf("Checkout: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(localDir, "only-local.txt"), []byte("local\n"), 0644); err != nil {
+		t.Fatalf("write local: %v", err)
+	}
+	if err := g.Add("only-local.txt"); err != nil {
+		t.Fatalf("Add local: %v", err)
+	}
+	if err := g.Commit("unpushed"); err != nil {
+		t.Fatalf("Commit unpushed: %v", err)
+	}
+	unpushed, err := g.Rev("HEAD")
+	if err != nil {
+		t.Fatalf("Rev unpushed: %v", err)
+	}
+	if err := g.VerifyCommitOnBranch("origin", mainBranch, unpushed); err == nil {
+		t.Fatal("unpushed commit must not verify as contained on the default branch")
+	}
+}
+
 // TestBranchPushedToRemote_SplitURL verifies that BranchPushedToRemote correctly
 // reports a branch as pushed when it exists on the push target (fork), even though
 // it's absent from the fetch URL (upstream). This is the GH#3224 fix.
