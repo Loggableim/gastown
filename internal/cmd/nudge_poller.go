@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -73,16 +74,26 @@ func runNudgePoller(cmd *cobra.Command, args []string) error {
 	// Resolve nudge options once at startup: if the target agent uses Escape
 	// as cancel (e.g., Gemini CLI), skip the Escape keystroke during delivery
 	// to avoid canceling in-flight generation. (GH#gt-wasn)
-	nudgeOpts := tmux.NudgeOpts{}
+	nudgeOpts := tmux.NudgeOpts{TownRoot: townRoot}
 	agentName := ""
 	hasIdleDetection := false
 	if name, err := t.GetEnvironment(sessionName, "GT_AGENT"); err == nil && name != "" {
 		agentName = name
-		if preset := config.GetAgentPresetByName(agentName); preset != nil {
-			hasIdleDetection = preset.HasIdleDetection()
-			if preset.EscapeCancelsRequest {
-				nudgeOpts.SkipEscape = true
+	}
+	preset := config.ResolveAgentPreset(agentName, townRoot)
+	if preset == nil {
+		if procNames, _ := t.GetEnvironment(sessionName, "GT_PROCESS_NAMES"); procNames != "" {
+			if strings.Contains(procNames, "kilo") {
+				preset = config.GetAgentPreset(config.AgentKilo)
+			} else if strings.Contains(procNames, "opencode") {
+				preset = config.GetAgentPreset(config.AgentOpenCode)
 			}
+		}
+	}
+	if preset != nil {
+		hasIdleDetection = preset.HasIdleDetection()
+		if preset.EscapeCancelsRequest {
+			nudgeOpts.SkipEscape = true
 		}
 	}
 

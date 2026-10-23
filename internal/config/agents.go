@@ -405,6 +405,7 @@ var builtinPresets = map[AgentPreset]*AgentPresetInfo{
 		HooksSettingsFile: "gastown.js",
 		ReadyDelayMs:      8000,
 		InstructionsFile:  "AGENTS.md",
+		BusyIndicatorIdle: false,
 		// ACP support
 		ACP: &ACPConfig{
 			Command: "acp",
@@ -733,6 +734,69 @@ func GetAgentPresetByName(name string) *AgentPresetInfo {
 	initRegistryLocked()
 	defer registryMu.Unlock()
 	return globalRegistry.Agents[name]
+}
+
+// ResolveAgentPreset resolves an agent name to its preset info.
+// Checks built-in preset registry first. If not found, checks common prefixes
+// (kilo-*, opencode-*, claude-*, gemini-*, codex-*, cursor-*).
+// If townRoot is provided, checks townSettings.Agents for custom agent definitions
+// and resolves their Provider or Command.
+func ResolveAgentPreset(agentName, townRoot string) *AgentPresetInfo {
+	if agentName == "" {
+		return nil
+	}
+	// Direct lookup
+	if preset := GetAgentPresetByName(agentName); preset != nil {
+		return preset
+	}
+	// Prefix / alias matching
+	switch {
+	case strings.HasPrefix(agentName, "kilo"):
+		return GetAgentPreset(AgentKilo)
+	case strings.HasPrefix(agentName, "opencode"):
+		return GetAgentPreset(AgentOpenCode)
+	case strings.HasPrefix(agentName, "claude"):
+		return GetAgentPreset(AgentClaude)
+	case strings.HasPrefix(agentName, "gemini"):
+		return GetAgentPreset(AgentGemini)
+	case strings.HasPrefix(agentName, "codex"):
+		return GetAgentPreset(AgentCodex)
+	case strings.HasPrefix(agentName, "cursor"):
+		return GetAgentPreset(AgentCursor)
+	case agentName == "mimo":
+		// MiMo runs kilo-gt under the hood
+		return GetAgentPreset(AgentKilo)
+	}
+
+	// Custom agent in town settings
+	if townRoot != "" {
+		settingsPath := TownSettingsPath(townRoot)
+		if ts, err := LoadOrCreateTownSettings(settingsPath); err == nil && ts != nil && ts.Agents != nil {
+			if custom, ok := ts.Agents[agentName]; ok && custom != nil {
+				if custom.Provider != "" {
+					if p := ResolveAgentPreset(custom.Provider, ""); p != nil {
+						return p
+					}
+				}
+				if custom.Command != "" {
+					cmdLower := strings.ToLower(custom.Command)
+					switch {
+					case strings.Contains(cmdLower, "kilo"):
+						return GetAgentPreset(AgentKilo)
+					case strings.Contains(cmdLower, "opencode"):
+						return GetAgentPreset(AgentOpenCode)
+					case strings.Contains(cmdLower, "claude"):
+						return GetAgentPreset(AgentClaude)
+					case strings.Contains(cmdLower, "gemini"):
+						return GetAgentPreset(AgentGemini)
+					case strings.Contains(cmdLower, "mimo"):
+						return GetAgentPreset(AgentKilo)
+					}
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // ListAgentPresets returns all known agent preset names.

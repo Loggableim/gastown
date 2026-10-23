@@ -2901,13 +2901,31 @@ func hasBusyIndicator(line string) bool {
 // Code whose TUI has no stable prompt prefix). When neither is available the
 // returned prefix falls back to DefaultReadyPromptPrefix, preserving the legacy
 // behavior for agents without any idle detection configured.
-func idleDetectionForSession(t *Tmux, session string) (promptPrefix string, busyIndicatorIdle bool) {
-	promptPrefix = DefaultReadyPromptPrefix
+func resolvePresetForSession(t *Tmux, session string) *config.AgentPresetInfo {
 	agentName, err := t.GetEnvironment(session, "GT_AGENT")
 	if err != nil || agentName == "" {
-		return promptPrefix, false
+		return nil
 	}
-	preset := config.GetAgentPresetByName(agentName)
+	townRoot, _ := t.GetEnvironment(session, "GT_TOWN_ROOT")
+	if townRoot == "" {
+		townRoot, _ = t.GetEnvironment(session, "GT_ROOT")
+	}
+	preset := config.ResolveAgentPreset(agentName, townRoot)
+	if preset == nil {
+		if procNames, _ := t.GetEnvironment(session, "GT_PROCESS_NAMES"); procNames != "" {
+			if strings.Contains(procNames, "kilo") {
+				preset = config.GetAgentPreset(config.AgentKilo)
+			} else if strings.Contains(procNames, "opencode") {
+				preset = config.GetAgentPreset(config.AgentOpenCode)
+			}
+		}
+	}
+	return preset
+}
+
+func idleDetectionForSession(t *Tmux, session string) (promptPrefix string, busyIndicatorIdle bool) {
+	promptPrefix = DefaultReadyPromptPrefix
+	preset := resolvePresetForSession(t, session)
 	if preset == nil {
 		return promptPrefix, false
 	}
@@ -2922,11 +2940,7 @@ func idleDetectionForSession(t *Tmux, session string) (promptPrefix string, busy
 
 func readyPromptPrefixForSession(t *Tmux, session string) string {
 	promptPrefix := DefaultReadyPromptPrefix
-	agentName, err := t.GetEnvironment(session, "GT_AGENT")
-	if err != nil || agentName == "" {
-		return promptPrefix
-	}
-	preset := config.GetAgentPresetByName(agentName)
+	preset := resolvePresetForSession(t, session)
 	if preset == nil || preset.ReadyPromptPrefix == "" {
 		return promptPrefix
 	}

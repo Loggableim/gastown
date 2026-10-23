@@ -1869,6 +1869,31 @@ func TestHasIdleDetection(t *testing.T) {
 	}
 }
 
+func TestResolveAgentPreset(t *testing.T) {
+	t.Parallel()
+
+	// Builtin lookup
+	if p := ResolveAgentPreset("kilo", ""); p == nil || p.Name != AgentKilo {
+		t.Errorf("ResolveAgentPreset(kilo) = %v, want AgentKilo", p)
+	}
+
+	// Prefix matching
+	if p := ResolveAgentPreset("kilo-efficient", ""); p == nil || p.Name != AgentKilo {
+		t.Errorf("ResolveAgentPreset(kilo-efficient) = %v, want AgentKilo", p)
+	}
+	if p := ResolveAgentPreset("opencode-custom", ""); p == nil || p.Name != AgentOpenCode {
+		t.Errorf("ResolveAgentPreset(opencode-custom) = %v, want AgentOpenCode", p)
+	}
+	if p := ResolveAgentPreset("mimo", ""); p == nil || p.Name != AgentKilo {
+		t.Errorf("ResolveAgentPreset(mimo) = %v, want AgentKilo", p)
+	}
+
+	// Unknown
+	if p := ResolveAgentPreset("nonexistent-bot", ""); p != nil {
+		t.Errorf("ResolveAgentPreset(nonexistent-bot) = %v, want nil", p)
+	}
+}
+
 func TestKiloPresetBuildCommandWithPrompt(t *testing.T) {
 	t.Parallel()
 
