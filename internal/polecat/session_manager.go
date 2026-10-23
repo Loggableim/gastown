@@ -18,6 +18,7 @@ import (
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/git"
+	"github.com/steveyegge/gastown/internal/nudge"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/runtime"
 	"github.com/steveyegge/gastown/internal/session"
@@ -505,6 +506,11 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 	}
 	runtime.ScheduleAutoSubmit(m.tmux, sessionID, runtimeConfig)
 
+	// Start nudge-queue poller so queued nudges drain for non-Claude runtimes (or idle Claude).
+	if _, pollerErr := nudge.StartPoller(townRoot, sessionID); pollerErr != nil {
+		debugSession("StartPoller error", pollerErr)
+	}
+
 	// Record agent's pane_id for ZFC-compliant liveness checks (gt-qmsx).
 	// Declared pane identity replaces process-tree inference in IsRuntimeRunning
 	// and FindAgentPane. Legacy sessions without GT_PANE_ID fall back to scanning.
@@ -661,6 +667,9 @@ func (m *SessionManager) Stop(polecat string, force bool) error {
 	if err := m.tmux.KillSessionWithProcesses(sessionID); err != nil {
 		return fmt.Errorf("killing session: %w", err)
 	}
+
+	// Stop nudge poller if running
+	_ = nudge.StopPoller(filepath.Dir(m.rig.Path), sessionID)
 
 	return nil
 }

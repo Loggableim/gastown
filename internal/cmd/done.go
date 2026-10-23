@@ -609,7 +609,11 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 							closeReason = fmt.Sprintf("%s\nskip_verify: true\ntarget_branch: %s\ncommit_sha: %s", closeReason, defaultBranch, noMRCommitSHA)
 						}
 					} else if !isNoMergeTask {
-						if verifyErr := g.VerifyPushedCommit("origin", defaultBranch, noMRCommitSHA); verifyErr != nil {
+						// No-MR close means HEAD is already on the default branch.
+						// Other actors advance that branch, so HEAD is an ancestor
+						// of the remote tip, not the tip itself (sk-b9f). Exact-tip
+						// verification stays on the post-push paths.
+						if verifyErr := g.VerifyCommitOnBranch("origin", defaultBranch, noMRCommitSHA); verifyErr != nil {
 							noteVerifiedPushFailure(cwd, issueID, defaultBranch, noMRCommitSHA, verifyErr)
 							return fmt.Errorf("cannot close no-MR code bead: %w", verifyErr)
 						}
@@ -654,11 +658,30 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		if fetchErr := g.Fetch("origin"); fetchErr != nil {
 			style.PrintWarning("could not fetch origin before contamination check: %v (proceeding with local refs)", fetchErr)
 		}
+		// sk-xsn: the push checkpoint is not the only "already pushed" signal.
+		// A PR-workflow branch (or a previous push whose checkpoint is gone)
+		// already has origin/<branch>. Rebasing that onto the merge target
+		// rewrites published commits and the non-force push fails forever.
+		publishedRef, published, behindPublished, aheadPublished, pubErr := detectPublishedBranch(g, branch, contaminationBase)
+		if pubErr != nil {
+			style.PrintWarning("could not compare %s with its published tip: %v", branch, pubErr)
+		}
 		contam, err := g.CheckBranchContamination(contaminationBase)
-		if err == nil && contam.Behind > 0 {
+		if err == nil {
 			const warnThreshold = 50
 			const blockThreshold = 200
-			if contam.Behind >= blockThreshold {
+			if published {
+				// A published PR is often behind the merge target. Do not block
+				// completion on that distance: the fix for it (rebase onto the
+				// target) is what makes the push non-fast-forward.
+				if contam.Behind >= blockThreshold {
+					style.PrintWarning("branch is %d commits behind %s (threshold: %d) but %s is already published — not rebasing onto %s",
+						contam.Behind, contaminationBase, blockThreshold, publishedRef, contaminationBase)
+				} else if contam.Behind >= warnThreshold {
+					style.PrintWarning("branch is %d commits behind %s and %s is already published — not rebasing onto %s",
+						contam.Behind, contaminationBase, publishedRef, contaminationBase)
+				}
+			} else if contam.Behind >= blockThreshold {
 				return fmt.Errorf("branch contamination: %d commits behind %s (threshold: %d)\n"+
 					"The branch is severely stale and will include unrelated changes in the PR.\n"+
 					"Fix: git fetch origin && git rebase %s",
@@ -667,19 +690,29 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 				style.PrintWarning("branch is %d commits behind %s — consider rebasing to avoid PR contamination", contam.Behind, contaminationBase)
 			}
 
-			// gh#3400: Auto-rebase the polecat branch onto the latest target before
-			// push, so the resulting MR/PR has a current base.
-			alreadyPushed := checkpoints[CheckpointPushed] == branch
-			rebased, skipReason, rebaseErr := autoRebaseOnTarget(g, contaminationBase, contam.Behind, donePreVerified, alreadyPushed)
-			if rebaseErr != nil {
-				return rebaseErr
-			}
-			if rebased {
-				fmt.Printf("%s Branch rebased onto %s\n", style.Bold.Render("✓"), contaminationBase)
-				// Recompute commits ahead since rebase rewrote history.
-				aheadCount, _ = g.CommitsAhead("origin/"+defaultBranch, "HEAD")
-			} else if skipReason != "" {
-				style.PrintWarning("branch is %d commits behind %s but %s; skipping auto-rebase", contam.Behind, contaminationBase, skipReason)
+			// gh#3400: Auto-rebase onto the latest target before push, so the
+			// resulting MR/PR has a current base. sk-xsn: a published branch
+			// rebases onto its own remote tip (fast-forward only), never onto
+			// the merge target.
+			plan := planAutoRebase(contaminationBase, publishedRef, contam.Behind, behindPublished, aheadPublished, published)
+			if plan.behind > 0 {
+				// The checkpoint skip only applies to a rewrite onto the merge
+				// target. Rebasing onto the branch's own published tip stays
+				// a fast-forward, so a stale checkpoint must not suppress it.
+				alreadyPushed := checkpoints[CheckpointPushed] == branch && plan.base == contaminationBase
+				rebased, skipReason, rebaseErr := autoRebaseOnTarget(g, plan.base, plan.behind, donePreVerified, alreadyPushed)
+				if rebaseErr != nil {
+					return rebaseErr
+				}
+				if rebased {
+					fmt.Printf("%s Branch rebased onto %s\n", style.Bold.Render("✓"), plan.base)
+					// Recompute commits ahead since rebase rewrote history.
+					aheadCount, _ = g.CommitsAhead("origin/"+defaultBranch, "HEAD")
+				} else if skipReason != "" {
+					style.PrintWarning("branch is %d commits behind %s but %s; skipping auto-rebase", plan.behind, plan.base, skipReason)
+				}
+			} else if plan.skipReason != "" {
+				style.PrintWarning("branch is %d commits behind %s but %s; skipping auto-rebase", contam.Behind, contaminationBase, plan.skipReason)
 			}
 		}
 
