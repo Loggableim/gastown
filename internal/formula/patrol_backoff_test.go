@@ -205,6 +205,54 @@ func TestDeaconPatrolDoesNotRunAgeBasedWispGC(t *testing.T) {
 	}
 }
 
+// TestPatrolFormulasDoNotRunAgeBasedWispGC verifies that no active patrol
+// reaps open wisps by age. Age-based GC is not attachment-, author-, or
+// label-scoped, so it deletes open wisps that are still live: mol-polecat-work
+// molecules attached to open beads, sling-context wisps, and merge-request
+// beads that must remain queued while the refinery is disabled.
+//
+// Stale open-wisp cleanup belongs to the reaper Dog outside active patrols.
+// Regression test for sk-qlb (Merge: gb-attach lost) and hq-3pp.
+func TestPatrolFormulasDoNotRunAgeBasedWispGC(t *testing.T) {
+	patrolFormulas := []string{
+		"mol-witness-patrol.formula.toml",
+		"mol-deacon-patrol.formula.toml",
+		"mol-refinery-patrol.formula.toml",
+	}
+
+	for _, name := range patrolFormulas {
+		t.Run(name, func(t *testing.T) {
+			content, err := formulasFS.ReadFile("formulas/" + name)
+			if err != nil {
+				t.Fatalf("reading %s: %v", name, err)
+			}
+
+			f, err := Parse(content)
+			if err != nil {
+				t.Fatalf("parsing %s: %v", name, err)
+			}
+
+			var inboxDesc string
+			for _, step := range f.Steps {
+				if step.ID == "inbox-check" {
+					inboxDesc = step.Description
+					break
+				}
+			}
+			if inboxDesc == "" {
+				t.Fatalf("%s: inbox-check step not found or has empty description", name)
+			}
+
+			if !strings.Contains(inboxDesc, "bd mol wisp gc --closed --force") {
+				t.Errorf("%s: inbox-check must keep closed-wisp cleanup", name)
+			}
+			if strings.Contains(inboxDesc, "bd mol wisp gc --age") {
+				t.Errorf("%s: inbox-check must not run age-based wisp GC inside an active patrol", name)
+			}
+		})
+	}
+}
+
 // TestPatrolFormulasUseDynamicBeadResolution verifies that patrol formulas
 // resolve their agent bead ID dynamically at runtime via `gt agents resolve`,
 // rather than hardcoding a prefix like `gt-<rig>-refinery`.
